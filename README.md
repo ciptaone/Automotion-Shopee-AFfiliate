@@ -4,12 +4,15 @@ Always-on backend + Flutter Android control app for automated, validated
 Shopee-affiliate content publishing to **Facebook Page** and **Threads**, with
 **Telegram** notifications.
 
-> **Part 1 status: FOUNDATION ONLY.** This repository contains the verified
-> foundation and the provider-agnostic integration **contracts**. The full
-> automation workflow (feed → AI image/caption → validation → publish → notify)
-> is intentionally **not** wired end-to-end yet. Every third-party integration
-> runs behind a deterministic mock or a hard "live disabled" latch, so **no real
-> post, message, or paid API call can occur** from this codebase as-is.
+> **Part 2 status: CONTROL SURFACE READY, PIPELINE NOT WIRED.** Parts 1–2
+> deliver the verified foundation (auth, scheduler, queue, integration
+> contracts) plus the Flutter control surface (dashboard, automation settings,
+> content preview, publishing history, integrations). The full automation
+> workflow (feed → AI image/caption → validation → publish → notify) is
+> intentionally **not** wired end-to-end yet; preview/history responses are
+> explicitly **fixture-tagged**. Every third-party integration runs behind a
+> deterministic mock or a hard "live disabled" latch, so **no real post,
+> message, or paid API call can occur** from this codebase as-is.
 
 ---
 
@@ -72,11 +75,17 @@ npm run dev                 # http://localhost:8080
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/health` | public | Readiness, DB, scheduler and per-integration status (no secrets). |
-| GET | `/v1/meta/integrations` | public | Per-service configuration state. |
+| GET | `/v1/meta/integrations` | public | Per-service configuration state + health classification. |
 | POST | `/v1/auth/token` | install key | Exchange the install key for a session JWT. |
 | GET | `/v1/me` | JWT | Echo verified token claims. |
 | GET | `/v1/scheduler/status` | JWT | Current Asia/Jakarta slot schedule. |
 | GET | `/v1/queue/jobs` | JWT | Recent job records. |
+| GET | `/v1/automation/status` | JWT | Dashboard status (Running/Paused/Degraded/Offline), today's slot counters. |
+| GET | `/v1/settings` | JWT | Current automation settings + effective scheduler config. |
+| PUT | `/v1/settings` | JWT | Update interval/slots/platform toggles/image policy (validated). |
+| POST | `/v1/automation/control` | JWT | Start / pause / resume automation (idempotent). |
+| GET | `/v1/content/preview?slot=` | JWT | Latest content preview for a slot (fixture-tagged until the pipeline exists). |
+| GET | `/v1/history/publishes` | JWT | Recent publish history (fixture-tagged until the pipeline exists). |
 
 ### Environment variables
 

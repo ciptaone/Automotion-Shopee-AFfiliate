@@ -1,95 +1,106 @@
 import 'package:flutter/material.dart';
 
-import '../core/app_config.dart';
+import '../core/autopilot_api.dart';
 import '../core/backend_client.dart';
-import '../core/secure_store.dart';
 import '../models/api_models.dart';
-import 'login_screen.dart';
+import '../models/automation_models.dart';
+import '../widgets/common.dart';
 
-/// Main control surface: backend health, scheduler status, integration health,
-/// and recent job activity. Everything shown here is READ-ONLY in Part 1 —
-/// start/pause/resume controls are wired in the automation part.
+/// What the operator sees at the top of the dashboard.
+enum AutomationDisplayStatus { offline, degraded, running, paused }
+
+/// Pure mapping from backend state to the displayed status. Kept separate from
+/// the widget tree so tests can assert it without rendering.
+AutomationDisplayStatus resolveDisplayStatus({
+  required bool hasData,
+  required bool offline,
+  required AutomationStatus? status,
+}) {
+  if (!hasData || status == null) {
+    return AutomationDisplayStatus.offline;
+  }
+  if (offline) {
+    // Data may be stale, but the backend state itself is unknown right now.
+    return AutomationDisplayStatus.offline;
+  }
+  if (status.degraded) {
+    return AutomationDisplayStatus.degraded;
+  }
+  return status.state == AutomationState.running
+      ? AutomationDisplayStatus.running
+      : AutomationDisplayStatus.paused;
+}
+
+/// Dashboard: automation status, today's slot capacity, publication outcomes,
+/// latest generated content (honestly empty until the pipeline exists) and the
+/// backend connection state.
 class DashboardScreen extends StatefulWidget {
-  const DashboardScreen({super.key});
+  const DashboardScreen({
+    super.key,
+    required this.api,
+    this.onSignOut,
+  });
+
+  final AutopilotApi api;
+  final VoidCallback? onSignOut;
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  late final BackendClient _client;
-
   bool _loading = true;
+  bool _offline = false;
   String? _error;
-  HealthReport? _health;
-  List<JobRecord> _jobs = const [];
+  bool _hasData = false;
+
+  AutomationStatus? _status;
+  DateTime? _lastSync;
 
   @override
   void initState() {
     super.initState();
-    _client = BackendClient(baseUrl: AppConfig.backendUrl);
     _refresh();
   }
 
   Future<void> _refresh() async {
     setState(() {
-      _loading = true;
+      _loading = !_hasData;
       _error = null;
     });
     try {
-      final healthJson = await _client.getPublic('/health');
-      final health = HealthReport.fromJson(healthJson);
-
-      List<JobRecord> jobs = const [];
-      try {
-        final jobsJson = await _client.getAuthed('/v1/queue/jobs?limit=20');
-        final raw = jobsJson['jobs'];
-        if (raw is List) {
-          jobs = raw
-              .whereType<Map<String, dynamic>>()
-              .map(JobRecord.fromJson)
-              .toList();
-        }
-      } catch (_) {
-        // Job list is non-fatal; the dashboard still renders health.
-      }
-
+      final status = await widget.api.fetchAutomationStatus();
       if (!mounted) return;
       setState(() {
-        _health = health;
-        _jobs = jobs;
+        _status = status;
+        _hasData = true;
         _loading = false;
+        _offline = false;
+        _error = null;
+        _lastSync = DateTime.now();
       });
     } on AuthException {
-      await _signOut();
-    } catch (e) {
+      widget.onSignOut?.call();
+    } on ApiException catch (e) {
       if (!mounted) return;
       setState(() {
-        _error = e.toString();
         _loading = false;
+        _offline = e is NetworkException;
+        _error = e.message;
       });
     }
   }
 
-  Future<void> _signOut() async {
-    await SecureStore.instance.clearSession();
-    if (!mounted) return;
-    Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute(
-        builder: (_) => LoginScreen(
-          backendUrl: AppConfig.backendUrl,
-          onLoggedIn: () {},
-        ),
-      ),
-      (_) => false,
-    );
+  void _signOut() {
+    widget.api.signOut();
+    widget.onSignOut?.call();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Autopilot Dashboard'),
+        title: const Text('Dashboard'),
         actions: [
           IconButton(
             tooltip: 'Refresh',
@@ -108,32 +119,46 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Widget _buildBody() {
-    if (_loading && _health == null) {
-      return const Center(child: CircularProgressIndicator());
+    if (_loading && !_hasData) {
+      return const LoadingState(label: 'Loading dashboard…');
     }
-    if (_error != null && _health == null) {
-      return _ErrorState(message: _error!, onRetry: _refresh);
+    if (!_hasData && _error != null) {
+      return ErrorStateView(message: _error!, onRetry: _refresh);
     }
 
-    final health = _health;
+    final status = _status;
+    final display = resolveDisplayStatus(
+      hasData: _hasData,
+      offline: _offline,
+      status: status,
+    );
+
     return RefreshIndicator(
       onRefresh: _refresh,
       child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.all(16),
         children: [
-          if (health != null) ...[
-            _HealthCard(health: health),
-            const SizedBox(height: 12),
-            _SchedulerCard(scheduler: health.scheduler),
-            const SizedBox(height: 12),
-            _IntegrationsCard(integrations: health.integrations),
+          const AlwaysOnBanner(),
+          if (_offline || _error != null)
+            InlineErrorBanner(
+              message: _offline
+                  ? 'Backend offline — showing the last known state.'
+                  : _error!,
+              onRetry: _refresh,
+            ),
+          _StatusCard(
+            display: display,
+            status: status,
+            lastSync: _lastSync,
+            backendUrl: widget.api.baseUrl,
+          ),
+          if (status != null) ...[
+            _SlotsCard(status: status),
+            _PublicationsCard(counts: status.publications),
+            _LatestContentCard(note: status.latestContentNote),
+            _ActivityCard(activity: status.recentActivity),
           ],
-          if (_error != null) ...[
-            const SizedBox(height: 4),
-            _ErrorState(message: _error!, onRetry: _refresh, compact: true),
-          ],
-          const SizedBox(height: 12),
-          _JobsCard(jobs: _jobs),
           const SizedBox(height: 24),
         ],
       ),
@@ -145,15 +170,62 @@ class _DashboardScreenState extends State<DashboardScreen> {
 /*  Cards                                                                     */
 /* -------------------------------------------------------------------------- */
 
-class _HealthCard extends StatelessWidget {
-  const _HealthCard({required this.health});
-  final HealthReport health;
+class _StatusCard extends StatelessWidget {
+  const _StatusCard({
+    required this.display,
+    required this.status,
+    required this.lastSync,
+    required this.backendUrl,
+  });
+
+  final AutomationDisplayStatus display;
+  final AutomationStatus? status;
+  final DateTime? lastSync;
+  final String backendUrl;
+
+  ({String label, Color color, IconData icon, String explanation}) get _visual {
+    final schemeColor = Colors.grey;
+    switch (display) {
+      case AutomationDisplayStatus.running:
+        return (
+          label: 'Running',
+          color: Colors.green,
+          icon: Icons.play_circle_rounded,
+          explanation:
+              'The backend is scheduling content automatically. Publishing stays disabled until live integrations are authorized.',
+        );
+      case AutomationDisplayStatus.paused:
+        return (
+          label: 'Paused',
+          color: Colors.orange,
+          icon: Icons.pause_circle_rounded,
+          explanation: 'Automation is paused. The backend stays online and ready.',
+        );
+      case AutomationDisplayStatus.degraded:
+        return (
+          label: 'Degraded',
+          color: Colors.redAccent,
+          icon: Icons.warning_amber_rounded,
+          explanation: 'Automation is on, but something needed for publishing is missing.',
+        );
+      case AutomationDisplayStatus.offline:
+        return (
+          label: 'Offline',
+          color: schemeColor,
+          icon: Icons.cloud_off_rounded,
+          explanation: 'The backend could not be reached from this device.',
+        );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    final ok = health.status == 'ok';
-    final scheme = Theme.of(context).colorScheme;
+    final visual = _visual;
+    final syncText = lastSync == null
+        ? 'never'
+        : '${_formatClock(lastSync!)}  ·  ${_relative(lastSync!)}';
     return Card(
+      margin: const EdgeInsets.only(bottom: 12),
       child: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -161,41 +233,61 @@ class _HealthCard extends StatelessWidget {
           children: [
             Row(
               children: [
-                Icon(
-                  ok ? Icons.check_circle_rounded : Icons.warning_rounded,
-                  color: ok ? Colors.green : Colors.orange,
+                Icon(visual.icon, size: 32, color: visual.color),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        visual.label,
+                        style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                              fontWeight: FontWeight.w700,
+                              color: visual.color,
+                            ),
+                      ),
+                      Text(
+                        'Automation status',
+                        style: Theme.of(context).textTheme.labelMedium,
+                      ),
+                    ],
+                  ),
                 ),
-                const SizedBox(width: 8),
-                Text('Backend ${health.status}',
-                    style: Theme.of(context).textTheme.titleMedium),
-                const Spacer(),
-                Text('v${health.version} · part ${health.part}',
-                    style: Theme.of(context).textTheme.labelSmall),
+                StatusChip(
+                  label: status?.timezone ?? 'Asia/Jakarta',
+                  color: Theme.of(context).colorScheme.primary,
+                  icon: Icons.schedule_rounded,
+                ),
               ],
             ),
             const SizedBox(height: 12),
-            _KeyValue('Uptime', '${health.uptimeSeconds}s'),
-            _KeyValue('Database', health.database.detail),
-            if (health.degradedReasons.isNotEmpty) ...[
+            Text(
+              visual.explanation,
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
+            ),
+            if (status != null && status!.degradedReasons.isNotEmpty) ...[
               const SizedBox(height: 8),
-              Text('Notes',
-                  style: Theme.of(context)
-                      .textTheme
-                      .labelMedium
-                      ?.copyWith(color: scheme.onSurfaceVariant)),
-              const SizedBox(height: 4),
-              for (final note in health.degradedReasons)
+              for (final reason in status!.degradedReasons)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 2),
                   child: Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('• ', style: TextStyle(color: scheme.primary)),
-                      Expanded(child: Text(note, style: const TextStyle(fontSize: 13))),
+                      Text('• ', style: TextStyle(color: visual.color)),
+                      Expanded(
+                        child: Text(reason, style: const TextStyle(fontSize: 12.5)),
+                      ),
                     ],
                   ),
                 ),
             ],
+            const Divider(height: 20),
+            KeyValueRow('Backend', backendUrl),
+            KeyValueRow('Last sync', syncText),
+            if (status != null) KeyValueRow('Server time', status!.serverTime),
           ],
         ),
       ),
@@ -203,266 +295,226 @@ class _HealthCard extends StatelessWidget {
   }
 }
 
-class _SchedulerCard extends StatelessWidget {
-  const _SchedulerCard({required this.scheduler});
-  final SchedulerStatus scheduler;
+class _SlotsCard extends StatelessWidget {
+  const _SlotsCard({required this.status});
+  final AutomationStatus status;
 
   @override
   Widget build(BuildContext context) {
-    final next = scheduler.nextSlot;
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.schedule_rounded,
-                    color: Theme.of(context).colorScheme.primary),
-                const SizedBox(width: 8),
-                Text('Scheduler', style: Theme.of(context).textTheme.titleMedium),
-                const Spacer(),
-                Chip(
-                  label: Text(scheduler.enabled ? 'Enabled' : 'Paused'),
-                  visualDensity: VisualDensity.compact,
-                  backgroundColor: scheduler.enabled
-                      ? Colors.green.shade50
-                      : Colors.grey.shade200,
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            _KeyValue('Time zone', scheduler.timezone),
-            _KeyValue('Interval', 'every ${scheduler.intervalMinutes} minutes'),
-            _KeyValue('Max slots / day', '${scheduler.maxSlotsPerDay}'),
-            _KeyValue('Slots today', '${scheduler.slotsToday} (${scheduler.today})'),
-            if (next != null)
-              _KeyValue('Next slot', '${next.key}  ·  ${next.scheduledFor}'),
-            const SizedBox(height: 4),
-            Text(scheduler.message,
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    )),
-          ],
-        ),
+    final pct = status.slotFill;
+    return SectionCard(
+      title: "Today's slots",
+      icon: Icons.calendar_view_day_rounded,
+      trailing: StatusChip(
+        label: '${status.slotsRemaining} left',
+        color: status.slotsRemaining == 0 ? Colors.red : Colors.green,
       ),
-    );
-  }
-}
-
-class _IntegrationsCard extends StatelessWidget {
-  const _IntegrationsCard({required this.integrations});
-  final List<IntegrationStatus> integrations;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.hub_rounded,
-                    color: Theme.of(context).colorScheme.primary),
-                const SizedBox(width: 8),
-                Text('Integrations', style: Theme.of(context).textTheme.titleMedium),
-              ],
-            ),
-            const SizedBox(height: 8),
-            for (final item in integrations)
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Icon(
-                      item.configured
-                          ? Icons.check_circle_rounded
-                          : Icons.circle_outlined,
-                      size: 18,
-                      color: item.configured ? Colors.green : Colors.grey,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(item.service,
-                              style: const TextStyle(
-                                  fontWeight: FontWeight.w600, fontSize: 13)),
-                          Text(item.detail,
-                              style: TextStyle(
-                                  fontSize: 12,
-                                  color: Theme.of(context)
-                                      .colorScheme
-                                      .onSurfaceVariant)),
-                        ],
-                      ),
-                    ),
-                    Text(item.mode,
-                        style: Theme.of(context).textTheme.labelSmall),
-                  ],
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _JobsCard extends StatelessWidget {
-  const _JobsCard({required this.jobs});
-  final List<JobRecord> jobs;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.workspaces_rounded,
-                    color: Theme.of(context).colorScheme.primary),
-                const SizedBox(width: 8),
-                Text('Recent jobs', style: Theme.of(context).textTheme.titleMedium),
-              ],
-            ),
-            const SizedBox(height: 8),
-            if (jobs.isEmpty)
-              Text('No jobs yet. The scheduler enqueues a job per slot.',
-                  style: Theme.of(context).textTheme.bodySmall),
-            for (final job in jobs)
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                child: Row(
-                  children: [
-                    _StatusDot(status: job.status),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(job.uniqueKey,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 13)),
-                    ),
-                    Text('${job.attempts}/${job.maxAttempts}',
-                        style: Theme.of(context).textTheme.labelSmall),
-                  ],
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _StatusDot extends StatelessWidget {
-  const _StatusDot({required this.status});
-  final String status;
-
-  @override
-  Widget build(BuildContext context) {
-    final color = switch (status) {
-      'succeeded' => Colors.green,
-      'failed' => Colors.red,
-      'running' => Colors.blue,
-      'cancelled' => Colors.grey,
-      _ => Colors.orange,
-    };
-    return Container(
-      width: 10,
-      height: 10,
-      decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-    );
-  }
-}
-
-/* -------------------------------------------------------------------------- */
-/*  Shared bits                                                              */
-/* -------------------------------------------------------------------------- */
-
-class _KeyValue extends StatelessWidget {
-  const _KeyValue(this.label, this.value);
-  final String label;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            width: 120,
-            child: Text(label,
-                style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                      color: Theme.of(context).colorScheme.onSurfaceVariant,
-                    )),
+      children: [
+        KeyValueRow('Date', '${status.today} (${status.timezone})'),
+        KeyValueRow('Capacity', '${status.slotsScheduled} slots scheduled'),
+        KeyValueRow('Used', '${status.slotsUsed} slots'),
+        KeyValueRow('Remaining', '${status.slotsRemaining} slots'),
+        const SizedBox(height: 8),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(999),
+          child: LinearProgressIndicator(
+            value: pct.clamp(0.0, 1.0),
+            minHeight: 8,
+            backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
           ),
-          Expanded(child: Text(value, style: const TextStyle(fontSize: 13))),
+        ),
+      ],
+    );
+  }
+}
+
+class _PublicationsCard extends StatelessWidget {
+  const _PublicationsCard({required this.counts});
+  final PublicationCounts counts;
+
+  @override
+  Widget build(BuildContext context) {
+    return SectionCard(
+      title: 'Publications',
+      icon: Icons.publish_rounded,
+      trailing: StatusChip(
+        label: 'source: ${counts.source}',
+        color: Theme.of(context).colorScheme.primary,
+        tooltip: 'Counters come from the live job queue, not from fixtures.',
+      ),
+      children: [
+        Row(
+          children: [
+            _Counter(
+              label: 'Succeeded',
+              value: counts.succeeded,
+              color: Colors.green,
+              icon: Icons.check_circle_rounded,
+            ),
+            _Counter(
+              label: 'Failed',
+              value: counts.failed,
+              color: Colors.red,
+              icon: Icons.cancel_rounded,
+            ),
+            _Counter(
+              label: 'Retrying',
+              value: counts.retrying,
+              color: Colors.orange,
+              icon: Icons.autorenew_rounded,
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'Counters cover today only and update as the backend processes jobs.',
+          style: Theme.of(context)
+              .textTheme
+              .bodySmall
+              ?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
+        ),
+      ],
+    );
+  }
+}
+
+class _Counter extends StatelessWidget {
+  const _Counter({
+    required this.label,
+    required this.value,
+    required this.color,
+    required this.icon,
+  });
+
+  final String label;
+  final int value;
+  final Color color;
+  final IconData icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: Column(
+        children: [
+          Icon(icon, color: color, size: 22),
+          const SizedBox(height: 4),
+          Text(
+            '$value',
+            style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                  fontWeight: FontWeight.w700,
+                  color: color,
+                ),
+          ),
+          Text(label, style: Theme.of(context).textTheme.labelSmall),
         ],
       ),
     );
   }
 }
 
-class _ErrorState extends StatelessWidget {
-  const _ErrorState({
-    required this.message,
-    required this.onRetry,
-    this.compact = false,
-  });
-
-  final String message;
-  final VoidCallback onRetry;
-  final bool compact;
+class _LatestContentCard extends StatelessWidget {
+  const _LatestContentCard({required this.note});
+  final String note;
 
   @override
   Widget build(BuildContext context) {
-    if (compact) {
-      return Card(
-        color: Theme.of(context).colorScheme.errorContainer,
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Row(
-            children: [
-              Icon(Icons.error_outline_rounded,
-                  color: Theme.of(context).colorScheme.onErrorContainer),
-              const SizedBox(width: 8),
-              Expanded(
-                child: Text(message,
-                    style: TextStyle(
-                        color: Theme.of(context).colorScheme.onErrorContainer,
-                        fontSize: 13)),
-              ),
-              TextButton(onPressed: onRetry, child: const Text('Retry')),
-            ],
-          ),
+    return SectionCard(
+      title: 'Latest generated content',
+      icon: Icons.auto_awesome_outlined,
+      children: [
+        EmptyStateView(
+          icon: Icons.image_not_supported_outlined,
+          title: 'Nothing generated yet',
+          message: note.isEmpty
+              ? 'The generation pipeline is not implemented yet.'
+              : note,
         ),
-      );
-    }
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(Icons.cloud_off_rounded,
-                size: 56, color: Theme.of(context).colorScheme.outline),
-            const SizedBox(height: 12),
-            Text(message, textAlign: TextAlign.center),
-            const SizedBox(height: 16),
-            FilledButton(onPressed: onRetry, child: const Text('Retry')),
-          ],
+        const SizedBox(height: 4),
+        Text(
+          'Open the Preview tab to inspect fixture content the client is built against.',
+          style: Theme.of(context)
+              .textTheme
+              .bodySmall
+              ?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
         ),
-      ),
+      ],
     );
   }
+}
+
+class _ActivityCard extends StatelessWidget {
+  const _ActivityCard({required this.activity});
+  final List<JobRecord> activity;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return SectionCard(
+      title: 'Recent activity',
+      icon: Icons.workspaces_rounded,
+      trailing: StatusChip(
+        label: 'job queue',
+        color: scheme.primary,
+      ),
+      children: [
+        if (activity.isEmpty)
+          EmptyStateView(
+            icon: Icons.inbox_outlined,
+            title: 'No activity yet',
+            message: 'Jobs appear here as soon as the scheduler enqueues a slot.',
+          ),
+        for (final job in activity)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 5),
+            child: Row(
+              children: [
+                StatusDot(color: _colorFor(job.status)),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    job.uniqueKey.isEmpty ? job.kind : job.uniqueKey,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                ),
+                Text(
+                  job.status,
+                  style: TextStyle(fontSize: 12, color: _colorFor(job.status)),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  '${job.attempts}/${job.maxAttempts}',
+                  style: Theme.of(context).textTheme.labelSmall,
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+
+  Color _colorFor(String status) => switch (status) {
+        'succeeded' => Colors.green,
+        'failed' => Colors.red,
+        'running' => Colors.blue,
+        'cancelled' => Colors.grey,
+        _ => Colors.orange,
+      };
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Formatting helpers                                                        */
+/* -------------------------------------------------------------------------- */
+
+String _formatClock(DateTime time) {
+  final local = time.toLocal();
+  String two(int v) => v.toString().padLeft(2, '0');
+  return '${two(local.hour)}:${two(local.minute)}';
+}
+
+String _relative(DateTime time) {
+  final delta = DateTime.now().difference(time);
+  if (delta.inSeconds < 60) return '${delta.inSeconds}s ago';
+  if (delta.inMinutes < 60) return '${delta.inMinutes}m ago';
+  return '${delta.inHours}h ago';
 }

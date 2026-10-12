@@ -54,6 +54,21 @@ async function main(): Promise<void> {
   /* --- 3. Container --- */
   const container = buildContainer({ env, logger });
 
+  /* --- 3b. Automation settings (validated + persisted) --- */
+  // Load before serving: init() is idempotent and never fails boot (it falls
+  // back to defaults and records a warning that /v1/settings surfaces).
+  await container.settings.init();
+  logger.info(
+    {
+      settingsStorage: container.settings.storageKind,
+      automationState: container.settings.current().automationState,
+      intervalMinutes: container.settings.current().intervalMinutes,
+      maxSlotsPerDay: container.settings.current().maxSlotsPerDay,
+      warning: container.settings.loadWarning,
+    },
+    'automation settings loaded',
+  );
+
   /* --- 4. Server --- */
   const app = await buildServer(container);
 

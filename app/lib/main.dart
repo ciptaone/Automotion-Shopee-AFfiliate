@@ -1,9 +1,10 @@
 import 'package:flutter/material.dart';
 
 import 'core/app_config.dart';
-import 'screens/dashboard_screen.dart';
-import 'screens/login_screen.dart';
+import 'core/autopilot_api.dart';
 import 'core/secure_store.dart';
+import 'screens/home_shell.dart';
+import 'screens/login_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -37,13 +38,17 @@ class AutopilotApp extends StatelessWidget {
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           color: Colors.white,
         ),
+        inputDecorationTheme: const InputDecorationTheme(
+          isDense: true,
+          labelStyle: TextStyle(fontSize: 14),
+        ),
       ),
       home: const _Bootstrap(),
     );
   }
 }
 
-/// Decides between login and dashboard based on whether a session exists.
+/// Decides between login and the control shell based on the stored session.
 class _Bootstrap extends StatefulWidget {
   const _Bootstrap();
 
@@ -53,11 +58,21 @@ class _Bootstrap extends StatefulWidget {
 
 class _BootstrapState extends State<_Bootstrap> {
   late Future<bool> _hasSession;
+  late final AutopilotApi _api;
 
   @override
   void initState() {
     super.initState();
+    _api = AutopilotApi.forEnvironment();
     _hasSession = SecureStore.instance.hasSession();
+  }
+
+  Future<void> _refreshSessionFlag() async {
+    await SecureStore.instance.clearSession();
+    if (!mounted) return;
+    setState(() {
+      _hasSession = SecureStore.instance.hasSession();
+    });
   }
 
   @override
@@ -69,10 +84,13 @@ class _BootstrapState extends State<_Bootstrap> {
           return const Scaffold(body: Center(child: CircularProgressIndicator()));
         }
         return snapshot.data == true
-            ? const DashboardScreen()
+            ? HomeShell(api: _api, onSignedOut: _refreshSessionFlag)
             : LoginScreen(
+                api: _api,
                 backendUrl: AppConfig.backendUrl,
-                onLoggedIn: () => setState(() {}),
+                onLoggedIn: () => setState(() {
+                  _hasSession = SecureStore.instance.hasSession();
+                }),
               );
       },
     );

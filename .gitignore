@@ -59,6 +59,10 @@ tmp/
 temp/
 .runtime/
 
+# --- Backend runtime state (settings persistence; never commit) ---
+backend/data/
+data/
+
 # --- Test artifacts ---
 .vitest-cache/
 test-results/

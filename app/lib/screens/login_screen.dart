@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../core/autopilot_api.dart';
 import '../core/backend_client.dart';
 import '../core/secure_store.dart';
 
@@ -9,12 +10,16 @@ import '../core/secure_store.dart';
 class LoginScreen extends StatefulWidget {
   const LoginScreen({
     super.key,
-    required this.backendUrl,
+    required this.api,
     required this.onLoggedIn,
+    this.backendUrl,
   });
 
-  final String backendUrl;
+  final AutopilotApi api;
   final VoidCallback onLoggedIn;
+
+  /// Display-only override; connectivity always uses [AutopilotApi].
+  final String? backendUrl;
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
@@ -24,14 +29,14 @@ class _LoginScreenState extends State<LoginScreen> {
   final _controller = TextEditingController();
   final _formKey = GlobalKey<FormState>();
 
-  late final BackendClient _client;
+  late final AutopilotApi _api;
   bool _busy = false;
   String? _error;
 
   @override
   void initState() {
     super.initState();
-    _client = BackendClient(baseUrl: widget.backendUrl);
+    _api = widget.api;
     _prefill();
   }
 
@@ -56,7 +61,7 @@ class _LoginScreenState extends State<LoginScreen> {
     });
     try {
       final key = _controller.text.trim();
-      await _client.redeemInstallKey(key);
+      await _api.redeemInstallKey(key);
       await SecureStore.instance.saveInstallKey(key);
       if (!mounted) return;
       widget.onLoggedIn();
@@ -136,7 +141,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                     const SizedBox(height: 24),
                     Text(
-                      'Backend: ${widget.backendUrl}',
+                      'Backend: ${widget.backendUrl ?? widget.api.baseUrl}',
                       textAlign: TextAlign.center,
                       style: Theme.of(context).textTheme.labelSmall?.copyWith(
                             color: scheme.outline,

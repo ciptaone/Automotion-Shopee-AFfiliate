@@ -12,6 +12,7 @@
  *  - Facebook/Threads publishers are constructed but HARD-DISABLED for live use.
  *  - Telegram uses the in-memory transport unless explicitly allowed live.
  */
+import path from 'node:path';
 import { createLogger, type Logger } from '../core/logger.js';
 import {
   describeIntegrationStatus,
@@ -19,6 +20,17 @@ import {
   type Env,
   type IntegrationStatus,
 } from '../core/env.js';
+import {
+  DEFAULT_AUTOMATION_SETTINGS,
+  FileSettingsStore,
+  InMemorySettingsStore,
+  MAX_INTERVAL_MINUTES,
+  MAX_SLOTS_PER_DAY,
+  MIN_INTERVAL_MINUTES,
+  SettingsService,
+  type SettingsStore,
+} from '../settings/automation-settings.js';
+import { automationDegradedReasons } from '../automation/status.js';
 import { createDatabaseHandle, type DatabaseHandle } from '../db/client.js';
 import { InMemoryJobQueue } from '../queue/job-queue.js';
 import { ShopeeFeedCsvImporter } from '../integrations/feed/shopee-feed-importer.js';
@@ -51,6 +63,7 @@ export interface AppContainer {
   readonly logger: Logger;
   readonly database: DatabaseHandle;
   readonly queue: JobQueue;
+  readonly settings: SettingsService;
   readonly feedImporter: ProductFeedImporter;
   readonly imageGenerator: ImageGenerator;
   readonly captionGenerator: CaptionGenerator;
@@ -59,6 +72,8 @@ export interface AppContainer {
   readonly threadsPublisher: Publisher;
   readonly notifier: Notifier;
   readonly schedulerConfig: SchedulerConfig;
+  /** Scheduler config with the APK-managed interval/slot overrides applied. */
+  effectiveSchedulerConfig(): SchedulerConfig;
   readonly corsOrigins: readonly string[];
 
   schedulerStatus(now?: Date): SchedulerStatus;
@@ -77,6 +92,7 @@ export interface BuildContainerOptions {
   /** Override any dependency for tests. */
   readonly overrides?: Partial<{
     queue: JobQueue;
+    settingsStore: SettingsStore;
     feedImporter: ProductFeedImporter;
     imageGenerator: ImageGenerator;
     captionGenerator: CaptionGenerator;
@@ -97,6 +113,34 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     timezone: env.SCHEDULER_TIMEZONE,
     intervalMinutes: env.SCHEDULER_INTERVAL_MINUTES,
     maxSlotsPerDay: env.SCHEDULER_MAX_SLOTS_PER_DAY,
+  };
+
+  /* --- Automation settings (Part 2: validated + persisted) --- */
+  // Environment values seed the DEFAULTS only; after boot the APK-managed
+  // settings (persisted via the store) are authoritative.
+  const seededDefaults = {
+    ...DEFAULT_AUTOMATION_SETTINGS,
+    intervalMinutes: clampInterval(env.SCHEDULER_INTERVAL_MINUTES),
+    maxSlotsPerDay: clampMaxSlots(env.SCHEDULER_INTERVAL_MINUTES, env.SCHEDULER_MAX_SLOTS_PER_DAY),
+    automationState: env.SCHEDULER_ENABLED === 'true' ? ('running' as const) : ('paused' as const),
+  };
+
+  const settingsStore: SettingsStore =
+    options.overrides?.settingsStore ??
+    (env.NODE_ENV === 'test'
+      ? new InMemorySettingsStore()
+      : new FileSettingsStore(path.join(process.cwd(), 'data', 'settings.json')));
+
+  const settings = new SettingsService(seededDefaults, settingsStore);
+
+  /** Scheduler config as currently configured through the APK settings screen. */
+  const currentSchedulerConfig = (): SchedulerConfig => {
+    const current = settings.current();
+    return {
+      ...schedulerConfig,
+      intervalMinutes: current.intervalMinutes,
+      maxSlotsPerDay: current.maxSlotsPerDay,
+    };
   };
 
   /* --- Integrations (defaults are all credential-free mocks) --- */
@@ -170,6 +214,7 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     logger,
     database,
     queue,
+    settings,
     feedImporter,
     imageGenerator,
     captionGenerator,
@@ -178,12 +223,13 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     threadsPublisher,
     notifier,
     schedulerConfig,
+    effectiveSchedulerConfig: currentSchedulerConfig,
     corsOrigins,
 
     schedulerStatus(now = new Date()) {
       return describeSchedulerStatus(
-        schedulerConfig,
-        env.SCHEDULER_ENABLED === 'true',
+        currentSchedulerConfig(),
+        settings.current().automationState === 'running',
         env.SCHEDULER_MODE,
         now,
       );
@@ -214,14 +260,21 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
 
     readiness() {
       const degradedReasons: string[] = [];
+      const current = settings.current();
       // The backend is READY if it can serve the APK. Missing optional
       // integrations degrade specific features but do not make it unready.
-      if (env.SCHEDULER_ENABLED !== 'true') {
-        degradedReasons.push('Scheduler disabled — no automatic publishing will occur.');
+      if (current.automationState !== 'running') {
+        degradedReasons.push(
+          'Automation is paused - the backend stays up but publishes nothing until it is started.',
+        );
       }
-      if (!facebookPublisher.info.ready && !threadsPublisher.info.ready) {
-        degradedReasons.push('No publishing destination is live-configured.');
-      }
+      degradedReasons.push(
+        ...automationDegradedReasons({
+          settings: current,
+          schedulerMode: env.SCHEDULER_MODE,
+          hasLiveDestination: facebookPublisher.info.ready || threadsPublisher.info.ready,
+        }),
+      );
       return { ready: true, degradedReasons };
     },
 
@@ -232,4 +285,20 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
   };
 
   return container;
+}
+
+
+/* -------------------------------------------------------------------------- */
+/*  Helpers                                                                   */
+/* -------------------------------------------------------------------------- */
+
+/** Clamp an env-provided interval into the validated settings range. */
+function clampInterval(value: number): number {
+  return Math.min(Math.max(value, MIN_INTERVAL_MINUTES), MAX_INTERVAL_MINUTES);
+}
+
+/** Clamp env slot limits so the seeded defaults always pass validation. */
+function clampMaxSlots(intervalMinutes: number, value: number): number {
+  const capped = Math.min(Math.max(value, 1), MAX_SLOTS_PER_DAY);
+  return Math.max(1, Math.min(capped, Math.floor((24 * 60) / clampInterval(intervalMinutes))));
 }

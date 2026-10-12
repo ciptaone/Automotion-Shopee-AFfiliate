@@ -10,25 +10,66 @@
  * surfaced as degraded health, never as a crash, so the APK can still reach the
  * dashboard to see what is wrong.
  */
+import { fileURLToPath } from 'node:url';
 import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
+import {
+  loadMigrationStatus,
+  type MigrationStatusReport,
+} from './migration-status.js';
 import * as schema from './schema.js';
 
 export type Database = PostgresJsDatabase<typeof schema>;
 
+/** Repository migrations folder, resolved relative to this module (src/ or dist/). */
+export const MIGRATIONS_FOLDER = fileURLToPath(new URL('../../drizzle', import.meta.url));
+
+/**
+ * Bounded connection pool: a runaway pool is an outage, so the ceiling is
+ * small and explicit. `prepare: false` keeps postgres.js in its safe protocol
+ * mode (required behind pgbouncer-style proxies).
+ */
+export const POOL_OPTIONS = {
+  max: 5,
+  connect_timeout: 10,
+  idle_timeout: 30,
+  max_lifetime: 300,
+  prepare: false,
+} as const;
+
 export interface DatabaseHandle {
   readonly db: Database | null;
+  /** Raw postgres.js handle (needed for connection-scoped primitives like
+   *  advisory locks). Null when no database is configured. */
+  readonly raw: ReturnType<typeof postgres> | null;
   readonly configured: boolean;
   /** True after a successful round-trip. */
   healthy(): Promise<boolean>;
   /** Human-readable, secret-free status detail. */
   statusDetail(): Promise<string>;
+  /**
+   * PART 5: read the migration journal and compare it with what this database
+   * actually has applied (null when no database is configured).
+   */
+  migrationStatus(): Promise<MigrationStatusReport | null>;
   close(): Promise<void>;
+}
+
+/**
+ * Strip credentials from anything derived from a connection string so an error
+ * message can be logged, returned by `/health` and pasted into an issue.
+ */
+export function sanitizeDatabaseError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  return raw
+    .split('\n')[0]
+    ?.replace(/postgres(ql)?:\/\/[^\s'"]*/gi, 'postgres://[REDACTED]')
+    ?.slice(0, 160) ?? 'database error';
 }
 
 /** Build a Drizzle client from a postgres.js connection. */
 export function createDatabase(databaseUrl: string): { db: Database; raw: ReturnType<typeof postgres> } {
-  const raw = postgres(databaseUrl, { max: 5, prepare: false });
+  const raw = postgres(databaseUrl, { ...POOL_OPTIONS });
   const db = drizzle(raw, { schema });
   return { db, raw };
 }
@@ -41,12 +82,16 @@ export function createDatabaseHandle(databaseUrl: string | undefined): DatabaseH
   if (!databaseUrl) {
     return {
       db: null,
+      raw: null,
       configured: false,
       async healthy() {
         return false;
       },
       async statusDetail() {
         return 'DATABASE_URL not set — running in in-memory mode.';
+      },
+      async migrationStatus() {
+        return null;
       },
       async close() {
         /* nothing to close */
@@ -68,6 +113,7 @@ export function createDatabaseHandle(databaseUrl: string | undefined): DatabaseH
 
   return {
     db,
+    raw,
     configured: true,
     async healthy() {
       if (!raw) {
@@ -88,9 +134,19 @@ export function createDatabaseHandle(databaseUrl: string | undefined): DatabaseH
         await raw`select 1`;
         return 'PostgreSQL reachable.';
       } catch (error) {
-        const message = error instanceof Error ? error.message : 'unknown error';
         // Connection errors can embed the DSN; keep only the first line, redacted.
-        return `PostgreSQL unreachable: ${message.split('\n')[0]?.slice(0, 120) ?? 'error'}`;
+        return `PostgreSQL unreachable: ${sanitizeDatabaseError(error)}`;
+      }
+    },
+    async migrationStatus() {
+      if (!raw) return null;
+      try {
+        return await loadMigrationStatus(MIGRATIONS_FOLDER, (text, params) =>
+          raw.unsafe(text, (params ?? []) as never[]),
+        );
+      } catch {
+        // Status is diagnostic only; never let it crash a caller.
+        return null;
       }
     },
     async close() {

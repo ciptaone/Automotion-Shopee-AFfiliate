@@ -132,7 +132,8 @@ export interface SlotStoreSnapshot {
 /* -------------------------------------------------------------------------- */
 
 export interface SlotStore {
-  readonly kind: 'memory' | 'file';
+  /** 'postgres' added in PART 5 (row-level store); see core/persistence.ts. */
+  readonly kind: 'memory' | 'file' | 'postgres';
   load(): Promise<SlotStoreSnapshot | null>;
   save(snapshot: SlotStoreSnapshot): Promise<void>;
 }
@@ -162,6 +163,55 @@ export class SlotStoreError extends AppError {
       context: {},
     });
   }
+}
+
+/**
+ * Raised when a row-level store refuses a write because the record changed
+ * underneath the caller (another worker committed first, or this worker's
+ * lease expired). The next pipeline attempt re-reads the fresh row first, so
+ * retrying is safe — but silently overwriting newer results never is.
+ */
+export class SlotWriteConflictError extends AppError {
+  constructor(slotKey: string) {
+    super({
+      code: 'SLOT_WRITE_CONFLICT',
+      category: 'conflict',
+      message: `Slot ${slotKey} was modified by another writer; the stale write was rejected.`,
+      expose: false,
+      retryable: true,
+      context: { slotKey },
+    });
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Atomic (row-level) store capability — PART 5                              */
+/* -------------------------------------------------------------------------- */
+
+export interface AtomicSlotWriteOutcome {
+  readonly ok: boolean;
+  /** Populated when `ok` is false: the row as it exists now (or null). */
+  readonly current: SlotContentRecord | null;
+}
+
+/**
+ * A `SlotStore` that also persists ONE row at a time with an optimistic guard.
+ *
+ * `SlotContentStore` prefers this over snapshot `save()`: `refresh()` makes a
+ * mutation start from database truth, and `write()` refuses stale writes. That
+ * is what turns "two workers, one slot" from an in-process promise chain into a
+ * database-enforced invariant.
+ */
+export interface AtomicSlotStore extends SlotStore {
+  readonly atomic: true;
+  /** Re-read one slot from durable storage (null when it does not exist). */
+  refresh(slotKey: string): Promise<SlotContentRecord | null>;
+  /** Insert-if-absent, or conditional update guarded by the expected version. */
+  write(record: SlotContentRecord): Promise<AtomicSlotWriteOutcome>;
+}
+
+export function isAtomicSlotStore(store: SlotStore): store is AtomicSlotStore {
+  return (store as Partial<AtomicSlotStore>).atomic === true;
 }
 
 /**
@@ -235,7 +285,7 @@ export class SlotContentStore {
 
   constructor(private readonly store: SlotStore = new InMemorySlotStore()) {}
 
-  get storageKind(): 'memory' | 'file' {
+  get storageKind(): 'memory' | 'file' | 'postgres' {
     return this.store.kind;
   }
 
@@ -288,6 +338,18 @@ export class SlotContentStore {
     const previous = this.locks.get(slotKey) ?? Promise.resolve();
     const run = previous.then(async () => {
       try {
+        // PART 5: for a row-level store the truth lives in the database, so a
+        // mutation re-reads its own row first. The file/memory store keeps its
+        // process-local map (nothing else can change it anyway).
+        if (isAtomicSlotStore(this.store)) {
+          const fresh = await this.store.refresh(slotKey);
+          if (fresh) {
+            this.slots.set(slotKey, fresh);
+          } else {
+            this.slots.delete(slotKey);
+          }
+          return await mapper(fresh);
+        }
         return await mapper(this.slots.get(slotKey) ?? null);
       } finally {
         // Keep the chain alive even when a mapper throws.
@@ -305,9 +367,29 @@ export class SlotContentStore {
     return run;
   }
 
-  /** Persist a record (called inside `mutate` by the pipeline). */
+  /**
+   * Persist a record (called inside `mutate` by the pipeline).
+   *
+   * With a row-level store this IS the durable write (no snapshot step), and a
+   * rejected write throws `SlotWriteConflictError` instead of pretending it
+   * landed: "never mark a step complete without a durable write".
+   */
   async put(record: SlotContentRecord): Promise<void> {
     await this.init();
+    if (isAtomicSlotStore(this.store)) {
+      const outcome = await this.store.write(record);
+      if (!outcome.ok) {
+        // Adopt the fresh row so the next read is not served from a stale copy.
+        if (outcome.current) {
+          this.slots.set(record.slotKey, outcome.current);
+        } else {
+          this.slots.delete(record.slotKey);
+        }
+        throw new SlotWriteConflictError(record.slotKey);
+      }
+      this.slots.set(record.slotKey, record);
+      return;
+    }
     this.slots.set(record.slotKey, record);
     await this.persist();
   }

@@ -1,13 +1,27 @@
 {
-  "version": "7",
-  "dialect": "postgresql",
-  "entries": [
-    {
-      "idx": 0,
-      "version": "7",
-      "when": 1791764518764,
-      "tag": "0000_init",
-      "breakpoints": true
-    }
-  ]
+    "version":  "7",
+    "dialect":  "postgresql",
+    "entries":  [
+                    {
+                        "idx":  0,
+                        "version":  "7",
+                        "when":  1791764518764,
+                        "tag":  "0000_init",
+                        "breakpoints":  true
+                    },
+                    {
+                        "idx":  1,
+                        "version":  "7",
+                        "when":  1791776656712,
+                        "tag":  "0001_part3_catalog",
+                        "breakpoints":  true
+                    },
+                    {
+                        "idx":  2,
+                        "version":  "7",
+                        "when":  1791804470863,
+                        "tag":  "0002_part5_persistence",
+                        "breakpoints":  true
+                    }
+                ]
 }

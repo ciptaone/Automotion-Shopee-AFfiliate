@@ -84,7 +84,7 @@ export const envSchema = z
     /* --- CORS (explicit allow-list; must not be "*" in production) --- */
     CORS_ORIGINS: corsOrigin,
 
-    /* --- Database (optional in Part 1; health reports "not configured") --- */
+    /* --- Database (Part 5: required for postgres/production deployments) --- */
     DATABASE_URL: z.preprocess(
       (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
       z
@@ -93,6 +93,16 @@ export const envSchema = z
         .refine((v) => /^postgres(ql)?:\/\//i.test(v), 'must be a postgres:// or postgresql:// URL')
         .optional(),
     ),
+
+    /**
+     * Which persistence backend this process is allowed to use.
+     *
+     * Left unset, it is derived from NODE_ENV (production -> postgres,
+     * test -> memory, development -> file). Setting it explicitly pins the
+     * choice so a missing database can NEVER silently downgrade the app to
+     * file/in-memory storage (see core/persistence.ts).
+     */
+    PERSISTENCE_BACKEND: z.enum(['postgres', 'file', 'memory']).optional(),
 
     /* --- Scheduler --- */
     SCHEDULER_ENABLED: z.enum(['true', 'false']).default('false'),
@@ -159,6 +169,30 @@ export const envSchema = z
           message: 'CORS_ORIGINS must not include "*" in production',
         });
       }
+    }
+
+    // PART 5: a postgres-backed process (explicitly requested, or production)
+    // must have a connection URL. This is the fail-closed switch that stops
+    // "database missing" from turning into "silently running on local files".
+    const requiresPostgres =
+      env.PERSISTENCE_BACKEND === 'postgres' || env.NODE_ENV === 'production';
+    if (requiresPostgres && !env.DATABASE_URL) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['DATABASE_URL'],
+        message:
+          'DATABASE_URL is required when PERSISTENCE_BACKEND is "postgres" or NODE_ENV is "production" ' +
+          '(file/in-memory persistence is development-only)',
+      });
+    }
+
+    // ...and production may never opt out of PostgreSQL.
+    if (env.NODE_ENV === 'production' && env.PERSISTENCE_BACKEND && env.PERSISTENCE_BACKEND !== 'postgres') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['PERSISTENCE_BACKEND'],
+        message: 'PERSISTENCE_BACKEND must be "postgres" in production (file/memory is development-only)',
+      });
     }
 
     // Scheduler interval must fit inside the daily slot budget.

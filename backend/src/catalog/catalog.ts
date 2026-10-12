@@ -111,7 +111,8 @@ export interface CatalogListFilter {
 /* -------------------------------------------------------------------------- */
 
 export interface CatalogStore {
-  readonly kind: 'memory' | 'file';
+  /** 'postgres' added in PART 5 (row per product); see core/persistence.ts. */
+  readonly kind: 'memory' | 'file' | 'postgres';
   load(): Promise<CatalogSnapshot | null>;
   save(snapshot: CatalogSnapshot): Promise<void>;
 }
@@ -253,7 +254,7 @@ export class ProductCatalog {
 
   constructor(private readonly store: CatalogStore = new InMemoryCatalogStore()) {}
 
-  get storageKind(): 'memory' | 'file' {
+  get storageKind(): 'memory' | 'file' | 'postgres' {
     return this.store.kind;
   }
 

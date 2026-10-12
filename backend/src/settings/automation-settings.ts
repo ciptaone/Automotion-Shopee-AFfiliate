@@ -198,7 +198,8 @@ export function parseSettingsPatch(input: unknown): AutomationSettingsPatch {
 
 export interface SettingsStore {
   /** How settings are persisted, surfaced to the APK ("memory" | "file"). */
-  readonly kind: 'memory' | 'file';
+  /** 'postgres' added in PART 5 (document row); see core/persistence.ts. */
+  readonly kind: 'memory' | 'file' | 'postgres';
   load(): Promise<AutomationSettings | null>;
   save(settings: AutomationSettings): Promise<void>;
 }
@@ -300,8 +301,8 @@ export class SettingsService {
     return this.value;
   }
 
-  /** How settings are persisted: "memory" | "file". */
-  get storageKind(): 'memory' | 'file' {
+  /** How settings are persisted: "memory" | "file" | "postgres" (Part 5). */
+  get storageKind(): 'memory' | 'file' | 'postgres' {
     return this.store.kind;
   }
 

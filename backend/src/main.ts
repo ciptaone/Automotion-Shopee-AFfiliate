@@ -15,6 +15,7 @@ import { EnvironmentError } from './core/errors.js';
 import { createLogger } from './core/logger.js';
 import { buildContainer } from './app/container.js';
 import { buildServer } from './app/server.js';
+import { recoverOnStartup } from './db/recovery.js';
 
 async function main(): Promise<void> {
   /* --- 1. Environment --- */
@@ -82,7 +83,52 @@ async function main(): Promise<void> {
     'product catalog loaded',
   );
 
-  /* --- 4. Server --- */
+  /* --- 4. Database readiness + crash recovery (Part 5) --- */
+  // Fail closed: a database-backed process that cannot reach its database, or
+  // whose schema was never migrated, must NOT start and look healthy while
+  // every write goes nowhere. Exit 78 (EX_CONFIG) with a secret-free reason.
+  if (container.persistence.backend === 'postgres') {
+    const problems: string[] = [];
+    if (!(await container.database.healthy())) {
+      problems.push(`database unreachable: ${await container.database.statusDetail()}`);
+    }
+    const migrations = await container.database.migrationStatus();
+    if (!migrations) {
+      problems.push('migration status could not be read from the database.');
+    } else if (!migrations.consistent) {
+      problems.push(`database schema is not up to date: ${migrations.problems.join('; ')}`);
+    }
+    if (problems.length > 0) {
+      logger.fatal(
+        { problems, persistence: container.persistence.backend },
+        'refusing to start: PostgreSQL persistence is required but unusable',
+      );
+      await container.shutdown();
+      process.exit(78); // EX_CONFIG
+    }
+
+    const recovery = await recoverOnStartup({
+      db: container.database.db,
+      queue: container.queue,
+      logger,
+    });
+    logger.info(
+      {
+        appliedMigrations: migrations?.appliedCount ?? 0,
+        requeuedJobs: recovery.requeuedJobs,
+        failedJobs: recovery.failedJobs,
+        releasedSlotLocks: recovery.releasedSlotLocks,
+        storage: {
+          settings: container.settings.storageKind,
+          catalog: container.catalog.storageKind,
+          slots: container.slots.storageKind,
+        },
+      },
+      'database ready; startup recovery complete',
+    );
+  }
+
+  /* --- 5. Server --- */
   const app = await buildServer(container);
 
   let shuttingDown = false;

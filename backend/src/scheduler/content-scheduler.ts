@@ -40,9 +40,12 @@
  * deployment remains BLOCKED / NOT_TESTED.
  */
 import type { JobQueue, JobRecord } from '../contracts/index.js';
+import { StaleClaimError } from '../core/errors.js';
 import type { Logger } from '../core/logger.js';
 import type { ContentPipeline } from '../automation/pipeline.js';
 import type { SettingsService } from '../settings/automation-settings.js';
+import type { SchedulerCheckpointStore } from '../db/postgres-settings-store.js';
+import type { SchedulerTickLock } from '../db/postgres-tick-lock.js';
 import {
   computeDailySlots,
   formatInTimeZone,
@@ -61,6 +64,15 @@ export function contentJobKey(slotKey: string): string {
   return `${CONTENT_JOB_KIND_PREFIX}${slotKey}`;
 }
 
+/** Durable checkpoint document key (PART 5). */
+export const CONTENT_SCHEDULER_CHECKPOINT_KEY = 'content_scheduler';
+/**
+ * Lease heartbeat cadence for an executing job (PART 5). Jobs normally finish
+ * well inside one lease (120s); a heartbeat is sent between pipeline attempts
+ * so a slow but alive worker is not treated as crashed.
+ */
+export const CONTENT_JOB_HEARTBEAT_MS = 30_000;
+
 export interface ContentSchedulerDeps {
   readonly queue: JobQueue;
   readonly pipeline: ContentPipeline;
@@ -72,6 +84,10 @@ export interface ContentSchedulerDeps {
   readonly now?: () => Date;
   /** Max due slots executed per tick (anti catch-up burst). Default 1. */
   readonly maxCatchUpPerTick?: number;
+  /** PART 5: durable tick bookkeeping (process-local store in dev/tests). */
+  readonly checkpoints?: SchedulerCheckpointStore;
+  /** PART 5: cross-process tick lock (advisory lock in PostgreSQL). */
+  readonly tickLock?: SchedulerTickLock;
 }
 
 export interface SlotOutcome {
@@ -142,6 +158,7 @@ export class ContentScheduler {
   private readonly maxCatchUpPerTick: number;
   private ticking = false;
   private lastTick: TickResult | null = null;
+  private tickLockHeld = false;
 
   constructor(private readonly deps: ContentSchedulerDeps) {
     this.now = deps.now ?? (() => new Date());
@@ -159,8 +176,10 @@ export class ContentScheduler {
   }
 
   /**
-   * One scheduling pass. Serialized: a tick never overlaps itself, so two
-   * ticks can never race to reserve/execute the same slot.
+   * One scheduling pass. Serialized in-process by a flag, and across processes
+   * by the optional `tickLock` (a PostgreSQL advisory lock in production), so
+   * two backends pointed at the same database can never both plan the same
+   * slot window.
    */
   async tick(): Promise<TickResult> {
     if (this.ticking) {
@@ -175,13 +194,112 @@ export class ContentScheduler {
         message: 'Tick already in progress; skipped overlapping tick.',
       };
     }
+
+    const lock = this.deps.tickLock;
+    if (lock && !(await lock.acquire())) {
+      // Another process is ticking right now. Doing nothing is always safe:
+      // the next tick re-plans from durable state (job uniqueness is what
+      // actually prevents duplicate work).
+      const locked: TickResult = {
+        at: this.now().toISOString(),
+        today: '',
+        enqueued: [],
+        executed: [],
+        skipped: [],
+        failed: [],
+        pendingJobs: 0,
+        message: 'Another process holds the scheduler tick lock; this tick was skipped.',
+      };
+      this.lastTick = locked;
+      return locked;
+    }
+    this.tickLockHeld = Boolean(lock);
+
     this.ticking = true;
     try {
       const result = await this.runTick();
       this.lastTick = result;
+      await this.writeCheckpoint(result);
       return result;
     } finally {
       this.ticking = false;
+      if (this.tickLockHeld) {
+        this.tickLockHeld = false;
+        await lock?.release();
+      }
+    }
+  }
+
+  /**
+   * PART 5: persist what the tick did so a restart reports an honest last run
+   * instead of pretending nothing ever happened. Best-effort by design: a
+   * checkpoint failure must never fail the tick itself (the slot/job tables are
+   * the real source of truth).
+   */
+  private async writeCheckpoint(result: TickResult): Promise<void> {
+    const store = this.deps.checkpoints;
+    if (!store) return;
+    try {
+      await store.write(CONTENT_SCHEDULER_CHECKPOINT_KEY, {
+        at: result.at,
+        today: result.today,
+        enqueued: result.enqueued.length,
+        executed: result.executed.length,
+        failed: result.failed.length,
+        skipped: result.skipped.length,
+        pendingJobs: result.pendingJobs,
+        message: result.message,
+        catchUpLimit: this.maxCatchUpPerTick,
+        lastExecutedSlots: result.executed.map((entry) => entry.slotKey).slice(-5),
+      });
+    } catch (error) {
+      this.deps.logger?.warn(
+        { err: error instanceof Error ? error.message : String(error) },
+        'scheduler checkpoint write failed (the tick itself still ran)',
+      );
+    }
+  }
+
+  /**
+   * PART 5: bookkeeping writes are guarded by the claim token and never fatal.
+   *
+   * If the lease was lost, `StaleClaimError` tells us another worker owns the
+   * job now — log it and walk away (forcing the write would overwrite newer
+   * results). Any other failure is logged too: the pipeline's durable state in
+   * `slot_contents` is already written, so the tick must keep going.
+   */
+  private async safeComplete(
+    jobId: string,
+    result: Readonly<Record<string, unknown>>,
+    claimToken: string | null,
+  ): Promise<void> {
+    try {
+      await this.deps.queue.complete(jobId, result, { claimToken });
+    } catch (error) {
+      this.deps.logger?.warn(
+        { jobId, err: error instanceof Error ? error.message : String(error) },
+        error instanceof StaleClaimError
+          ? 'job completion skipped: this worker no longer owns the claim'
+          : 'job completion could not be recorded',
+      );
+    }
+  }
+
+  private async safeFail(
+    jobId: string,
+    message: string,
+    retryable: boolean,
+    claimToken: string | null,
+  ): Promise<void> {
+    try {
+      await this.deps.queue.fail(jobId, message, retryable, { claimToken });
+    } catch (error) {
+      this.deps.logger?.warn(
+        { jobId, err: error instanceof Error ? error.message : String(error) },
+        error instanceof StaleClaimError
+          ? 'job failure skipped: this worker no longer owns the claim'
+          : 'job failure could not be recorded',
+      );
     }
   }
 
@@ -276,6 +394,8 @@ export class ContentScheduler {
         await queue.fail(job.id, 'content job uniqueKey missing slot identity', false);
         continue;
       }
+      const claimToken = job.claimToken ?? null;
+      const heartbeat = this.startHeartbeat(job);
       try {
         const result = await pipeline.runSlot(slotKey);
         const outcome: SlotOutcome = {
@@ -288,10 +408,11 @@ export class ContentScheduler {
           // Recoverable: let the queue reschedule with backoff; the pipeline
           // resumes and reuses any valid assets already produced.
           failed.push(outcome);
-          await queue.fail(
+          await this.safeFail(
             job.id,
             result.record.lastError ?? 'pipeline reported a failed stage',
             true,
+            claimToken,
           );
           logger?.warn(
             { slotKey, stage: result.record.stage, error: result.record.lastError },
@@ -300,7 +421,7 @@ export class ContentScheduler {
         } else {
           // publish_ready or blocked (terminal) — done, never republished.
           executed.push(outcome);
-          await queue.complete(job.id, { stage: result.record.stage });
+          await this.safeComplete(job.id, { stage: result.record.stage }, claimToken);
           logger?.info(
             { slotKey, stage: result.record.stage, productId: result.record.productId },
             `content slot ${result.record.stage}`,
@@ -309,8 +430,10 @@ export class ContentScheduler {
       } catch (error) {
         const message = error instanceof Error ? error.message.split('\n')[0]?.slice(0, 200) : 'unknown';
         failed.push({ slotKey, stage: 'failed', productId: null, attempts: job.attempts });
-        await queue.fail(job.id, message ?? 'unknown error', true);
+        await this.safeFail(job.id, message ?? 'unknown error', true, claimToken);
         logger?.error({ slotKey, err: error }, 'content slot execution threw; queued for retry');
+      } finally {
+        if (heartbeat) clearInterval(heartbeat);
       }
     }
 
@@ -329,6 +452,38 @@ export class ContentScheduler {
       pendingJobs: await this.countPending(queue),
       message,
     };
+  }
+
+  /**
+   * PART 5: keep a running job's lease alive while it works.
+   *
+   * Only relevant for the PostgreSQL queue (only it mints claim tokens). The
+   * timer is unref'd, so it can never keep the process alive on its own, and a
+   * refused renewal is only logged — the pipeline's own durable writes are
+   * still protected by the slot row's optimistic version.
+   */
+  private startHeartbeat(job: JobRecord): NodeJS.Timeout | null {
+    const token = job.claimToken;
+    const extend = this.deps.queue.extendLease;
+    if (!token || typeof extend !== 'function') return null;
+
+    const timer = setInterval(() => {
+      void extend
+        .call(this.deps.queue, job.id, token)
+        .then((renewed) => {
+          if (!renewed) {
+            this.deps.logger?.warn(
+              { jobId: job.id },
+              'lease renewal was refused — another worker may have taken this job',
+            );
+          }
+        })
+        .catch(() => {
+          /* transient DB error: the lease simply expires later */
+        });
+    }, CONTENT_JOB_HEARTBEAT_MS);
+    timer.unref?.();
+    return timer;
   }
 
   private async countPending(queue: JobQueue): Promise<number> {

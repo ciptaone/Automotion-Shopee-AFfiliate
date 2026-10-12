@@ -28,7 +28,10 @@ credentials.json
 service-account*.json
 
 # --- Drizzle / local db dumps ---
-backend/drizzle/meta/*_snapshot.json
+# Drizzle snapshots MUST be committed: `drizzle-kit generate` diffs the live
+# schema against the snapshot of the last journal entry, so without it a fresh
+# clone would silently re-generate migrations that already exist (PART 5).
+# backend/drizzle/meta/*_snapshot.json
 *.sql.gz
 dump*.sql
 

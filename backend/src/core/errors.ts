@@ -368,6 +368,27 @@ export class LivePublishBlockedError extends AppError {
   }
 }
 
+/**
+ * Thrown when a worker tries to commit the result of a job it no longer owns
+ * (its lease expired and another worker took over).
+ *
+ * PART 5: this is the "stale worker must not overwrite newer results" guard.
+ * It is NOT retryable by the caller — the job belongs to the new owner now, so
+ * the correct response is to log it and walk away, never to force the write.
+ */
+export class StaleClaimError extends AppError {
+  constructor(jobId: string, reason: string) {
+    super({
+      code: 'STALE_JOB_CLAIM',
+      category: 'conflict',
+      message: `Job ${jobId} was not updated: ${reason}`,
+      expose: false,
+      retryable: false,
+      context: { jobId, reason },
+    });
+  }
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Narrowing helpers                                                         */
 /* -------------------------------------------------------------------------- */

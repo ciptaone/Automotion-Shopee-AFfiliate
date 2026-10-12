@@ -62,6 +62,21 @@ import {
   type SchedulerConfig,
   type SchedulerStatus,
 } from '../scheduler/slots.js';
+import {
+  InMemorySchedulerCheckpointStore,
+  PostgresSchedulerCheckpointStore,
+  PostgresSettingsStore,
+  type SchedulerCheckpointStore,
+} from '../db/postgres-settings-store.js';
+import { PostgresCatalogStore } from '../db/postgres-catalog-store.js';
+import { PostgresJobQueue } from '../db/postgres-job-queue.js';
+import { PostgresSlotStore } from '../db/postgres-slot-store.js';
+import { PostgresSchedulerTickLock } from '../db/postgres-tick-lock.js';
+import {
+  resolvePersistenceBackend,
+  type PersistenceDecision,
+} from '../core/persistence.js';
+import { EnvironmentError } from '../core/errors.js';
 import type {
   CaptionGenerator,
   ImageGenerator,
@@ -76,6 +91,8 @@ export interface AppContainer {
   readonly env: Env;
   readonly logger: Logger;
   readonly database: DatabaseHandle;
+  /** PART 5: which persistence backend this process actually runs on. */
+  readonly persistence: PersistenceDecision;
   readonly queue: JobQueue;
   readonly settings: SettingsService;
   readonly feedImporter: ProductFeedImporter;
@@ -86,6 +103,8 @@ export interface AppContainer {
   readonly threadsPublisher: Publisher;
   readonly notifier: Notifier;
   readonly schedulerConfig: SchedulerConfig;
+  /** PART 5: durable scheduler tick state (postgres) or process-local (dev). */
+  readonly schedulerCheckpoints: SchedulerCheckpointStore;
   /** Persistent product catalog (Part 3). */
   readonly catalog: ProductCatalog;
   /** Per-slot content records: reservation, image count, assets, captions. */
@@ -132,6 +151,7 @@ export interface BuildContainerOptions {
     threadsPublisher: Publisher;
     notifier: Notifier;
     database: DatabaseHandle;
+    schedulerCheckpoints?: SchedulerCheckpointStore;
   }>;
 }
 
@@ -146,6 +166,30 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     maxSlotsPerDay: env.SCHEDULER_MAX_SLOTS_PER_DAY,
   };
 
+  /* --- Persistence backend (Part 5: explicit, fail-closed) --- */
+  const database = options.overrides?.database ?? createDatabaseHandle(env.DATABASE_URL);
+
+  const persistence = resolvePersistenceBackend({
+    nodeEnv: env.NODE_ENV,
+    persistenceBackend: env.PERSISTENCE_BACKEND,
+    databaseUrl: env.DATABASE_URL,
+  });
+
+  if (persistence.errors.length > 0) {
+    // Refusing to start beats the alternative: quietly switching to a file or
+    // in-memory store would make the backend look healthy while every write
+    // disappears at the next restart.
+    throw new EnvironmentError(['DATABASE_URL', 'PERSISTENCE_BACKEND'], persistence.errors.join(' '));
+  }
+
+  const postgresDb = persistence.backend === 'postgres' ? database.db : null;
+  if (persistence.backend === 'postgres' && !postgresDb) {
+    throw new EnvironmentError(
+      ['DATABASE_URL'],
+      'PERSISTENCE_BACKEND is "postgres" but no database connection could be created.',
+    );
+  }
+
   /* --- Automation settings (Part 2: validated + persisted) --- */
   // Environment values seed the DEFAULTS only; after boot the APK-managed
   // settings (persisted via the store) are authoritative.
@@ -158,32 +202,48 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
 
   const settingsStore: SettingsStore =
     options.overrides?.settingsStore ??
-    (env.NODE_ENV === 'test'
-      ? new InMemorySettingsStore()
-      : new FileSettingsStore(path.join(process.cwd(), 'data', 'settings.json')));
+    (postgresDb
+      ? new PostgresSettingsStore(postgresDb)
+      : env.NODE_ENV === 'test'
+        ? new InMemorySettingsStore()
+        : new FileSettingsStore(path.join(process.cwd(), 'data', 'settings.json')));
 
   const settings = new SettingsService(seededDefaults, settingsStore);
 
   /* --- Catalog + slot content + pipeline (Part 3) --- */
-  // Like settings: file-backed persistence by default (verified here),
-  // in-memory under test. A PostgreSQL-backed store plugs in behind the same
-  // interfaces (schema in db/schema.ts, migration 0001_part3_catalog.sql).
+  // Storage is chosen ONCE here: PostgreSQL when the process is database-backed,
+  // otherwise the verified file store (development) or in-memory (tests). There
+  // is no runtime fallback between them.
   const isTest = env.NODE_ENV === 'test';
 
   const catalogStore: CatalogStore =
     options.overrides?.catalogStore ??
-    (isTest
-      ? new InMemoryCatalogStore()
-      : new FileCatalogStore(path.join(process.cwd(), 'data', 'catalog.json')));
+    (postgresDb
+      ? new PostgresCatalogStore(postgresDb)
+      : isTest
+        ? new InMemoryCatalogStore()
+        : new FileCatalogStore(path.join(process.cwd(), 'data', 'catalog.json')));
 
   const slotStore: SlotStore =
     options.overrides?.slotStore ??
-    (isTest
-      ? new InMemorySlotStore()
-      : new FileSlotStore(path.join(process.cwd(), 'data', 'slots.json')));
+    (postgresDb
+      ? new PostgresSlotStore(postgresDb)
+      : isTest
+        ? new InMemorySlotStore()
+        : new FileSlotStore(path.join(process.cwd(), 'data', 'slots.json')));
 
   const catalog = new ProductCatalog(catalogStore);
   const slots = new SlotContentStore(slotStore);
+
+  /** PART 5: durable scheduler checkpoints (postgres) or process-local (dev). */
+  const schedulerCheckpoints: SchedulerCheckpointStore =
+    options.overrides?.schedulerCheckpoints ??
+    (postgresDb ? new PostgresSchedulerCheckpointStore(postgresDb) : new InMemorySchedulerCheckpointStore());
+
+  /** PART 5: one queue implementation per backend, same contract. */
+  const queue: JobQueue =
+    options.overrides?.queue ??
+    (postgresDb ? new PostgresJobQueue({ db: postgresDb }) : new InMemoryJobQueue());
 
   /** Scheduler config as currently configured through the APK settings screen. */
   const currentSchedulerConfig = (): SchedulerConfig => {
@@ -260,10 +320,6 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
       telegramTransport,
     );
 
-  const queue = options.overrides?.queue ?? new InMemoryJobQueue();
-
-  const database = options.overrides?.database ?? createDatabaseHandle(env.DATABASE_URL);
-
   const corsOrigins = parseCorsOrigins(env.CORS_ORIGINS);
 
   /** The real content pipeline. Never publishes: live publishing stays disabled. */
@@ -284,12 +340,18 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     settings,
     schedulerConfig: currentSchedulerConfig,
     logger,
+    // PART 5: durable tick bookkeeping + a cross-process lock, so two backend
+    // processes on one database cannot both plan the same slot window.
+    checkpoints: schedulerCheckpoints,
+    tickLock:
+      postgresDb && database.raw ? new PostgresSchedulerTickLock(database.raw) : undefined,
   });
 
   const container: AppContainer = {
     env,
     logger,
     database,
+    persistence,
     queue,
     settings,
     feedImporter,
@@ -300,6 +362,7 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     threadsPublisher,
     notifier,
     schedulerConfig,
+    schedulerCheckpoints,
     catalog,
     slots,
     pipeline,

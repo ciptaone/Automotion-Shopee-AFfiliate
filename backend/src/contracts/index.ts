@@ -330,6 +330,17 @@ export interface JobRecord {
   readonly lastError: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /**
+   * PART 5 (lease-based claiming, populated by the PostgreSQL queue only):
+   * who owns a running job, when the lease started, when it expires, and the
+   * per-claim token a worker must present to commit its result. Everything is
+   * optional so the in-memory queue and existing assertions are untouched.
+   */
+  readonly claimedBy?: string | null;
+  readonly claimedAt?: string | null;
+  readonly leaseExpiresAt?: string | null;
+  readonly claimToken?: string | null;
+  readonly completedAt?: string | null;
 }
 
 export interface EnqueueJobInput {
@@ -338,6 +349,21 @@ export interface EnqueueJobInput {
   readonly scheduledFor: string;
   readonly payload: Readonly<Record<string, unknown>>;
   readonly maxAttempts?: number;
+}
+
+/** Proof of ownership presented on `complete`/`fail` (Part 5). */
+export interface JobClaimOptions {
+  readonly claimToken?: string | null;
+}
+
+/** Result of sweeping jobs whose worker died holding a lease. */
+export interface LeaseRecoverySummary {
+  /** Expired leases put back in the queue for another worker. */
+  readonly requeued: number;
+  /** Expired leases whose attempt budget was exhausted -> failed. */
+  readonly failed: number;
+  /** Job ids that were touched (secret-free). */
+  readonly jobIds: readonly string[];
 }
 
 /**
@@ -351,9 +377,41 @@ export interface JobQueue {
   enqueue(input: EnqueueJobInput): Promise<JobRecord>;
   /** Atomically claim the next due job. Returns null when nothing is due. */
   claim(workerId: string): Promise<JobRecord | null>;
-  complete(jobId: string, result?: Readonly<Record<string, unknown>>): Promise<void>;
-  fail(jobId: string, error: string, retryable: boolean): Promise<JobRecord>;
+  /**
+   * Mark a job succeeded. When `options.claimToken` is supplied (PostgreSQL
+   * queue) the write is guarded by it, so a worker whose lease already expired
+   * cannot overwrite a newer owner's result — that raises `StaleClaimError`.
+   */
+  complete(
+    jobId: string,
+    result?: Readonly<Record<string, unknown>>,
+    options?: JobClaimOptions,
+  ): Promise<void>;
+  fail(
+    jobId: string,
+    error: string,
+    retryable: boolean,
+    options?: JobClaimOptions,
+  ): Promise<JobRecord>;
   get(jobId: string): Promise<JobRecord | null>;
   getByUniqueKey(uniqueKey: string): Promise<JobRecord | null>;
   list(limit?: number): Promise<readonly JobRecord[]>;
+  /**
+   * Optional (PostgreSQL queue): renew the lease of a job that is taking
+   * longer than its initial lease. Returns false when ownership was lost.
+   */
+  extendLease?(jobId: string, claimToken: string, leaseMs?: number): Promise<boolean>;
+}
+
+/**
+ * Optional capability: sweep jobs whose worker crashed while holding a lease.
+ * Implemented by the PostgreSQL queue; recovery is a no-op in memory (state
+ * does not survive a restart there anyway).
+ */
+export interface RecoverableJobQueue extends JobQueue {
+  recoverExpiredLeases(): Promise<LeaseRecoverySummary>;
+}
+
+export function isRecoverableJobQueue(queue: JobQueue): queue is RecoverableJobQueue {
+  return typeof (queue as Partial<RecoverableJobQueue>).recoverExpiredLeases === 'function';
 }

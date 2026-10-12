@@ -1,0 +1,65 @@
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# --- Node / Backend ---
+node_modules/
+backend/dist/
+build/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+
+# --- Secrets & local env ---
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+secrets/
+credentials.json
+service-account*.json
+
+# --- Drizzle / local db dumps ---
+backend/drizzle/meta/*_snapshot.json
+*.sql.gz
+dump*.sql
+
+# --- Flutter / Dart ---
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+.pub-cache/
+.pub/
+coverage/
+*.iml
+ios/Pods/
+android/.gradle/
+android/local.properties
+android/key.properties
+*.jks
+*.keystore
+*.ipa
+*.apk
+!docs/**/*.apk
+
+# --- Logs & runtime ---
+*.log
+logs/
+tmp/
+temp/
+.runtime/
+
+# --- Test artifacts ---
+.vitest-cache/
+test-results/
+evidence/**/*.tmp

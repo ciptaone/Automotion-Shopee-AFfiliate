@@ -1,0 +1,235 @@
+/**
+ * Application container (composition root).
+ *
+ * Wires configuration, logging, database, integrations, queue and scheduler into
+ * a single object that the HTTP layer and the tests both consume. Keeping all
+ * wiring here means the HTTP layer never constructs a vendor client directly and
+ * tests can swap any dependency for a mock.
+ *
+ * Part 1 wiring rules:
+ *  - AI image/text default to deterministic mocks.
+ *  - Object storage defaults to the in-memory mock.
+ *  - Facebook/Threads publishers are constructed but HARD-DISABLED for live use.
+ *  - Telegram uses the in-memory transport unless explicitly allowed live.
+ */
+import { createLogger, type Logger } from '../core/logger.js';
+import {
+  describeIntegrationStatus,
+  parseCorsOrigins,
+  type Env,
+  type IntegrationStatus,
+} from '../core/env.js';
+import { createDatabaseHandle, type DatabaseHandle } from '../db/client.js';
+import { InMemoryJobQueue } from '../queue/job-queue.js';
+import { ShopeeFeedCsvImporter } from '../integrations/feed/shopee-feed-importer.js';
+import { MockCaptionGenerator, MockImageGenerator } from '../integrations/ai/mock-ai.js';
+import { MemoryObjectStorage } from '../integrations/storage/object-storage.js';
+import {
+  FacebookPagePublisher,
+  StubGraphTransport,
+  ThreadsPublisher,
+} from '../integrations/publishing/publishers.js';
+import { MemoryTelegramTransport, TelegramNotifier } from '../integrations/notifications/telegram.js';
+import {
+  DEFAULT_SCHEDULER_CONFIG,
+  describeSchedulerStatus,
+  type SchedulerConfig,
+  type SchedulerStatus,
+} from '../scheduler/slots.js';
+import type {
+  CaptionGenerator,
+  ImageGenerator,
+  JobQueue,
+  Notifier,
+  ObjectStorage,
+  ProductFeedImporter,
+  Publisher,
+} from '../contracts/index.js';
+
+export interface AppContainer {
+  readonly env: Env;
+  readonly logger: Logger;
+  readonly database: DatabaseHandle;
+  readonly queue: JobQueue;
+  readonly feedImporter: ProductFeedImporter;
+  readonly imageGenerator: ImageGenerator;
+  readonly captionGenerator: CaptionGenerator;
+  readonly storage: ObjectStorage;
+  readonly facebookPublisher: Publisher;
+  readonly threadsPublisher: Publisher;
+  readonly notifier: Notifier;
+  readonly schedulerConfig: SchedulerConfig;
+  readonly corsOrigins: readonly string[];
+
+  schedulerStatus(now?: Date): SchedulerStatus;
+  integrationStatuses(): IntegrationStatus[];
+  /** Aggregate readiness used by /health. */
+  readiness(): {
+    ready: boolean;
+    degradedReasons: string[];
+  };
+  shutdown(): Promise<void>;
+}
+
+export interface BuildContainerOptions {
+  readonly env: Env;
+  readonly logger?: Logger;
+  /** Override any dependency for tests. */
+  readonly overrides?: Partial<{
+    queue: JobQueue;
+    feedImporter: ProductFeedImporter;
+    imageGenerator: ImageGenerator;
+    captionGenerator: CaptionGenerator;
+    storage: ObjectStorage;
+    facebookPublisher: Publisher;
+    threadsPublisher: Publisher;
+    notifier: Notifier;
+    database: DatabaseHandle;
+  }>;
+}
+
+export function buildContainer(options: BuildContainerOptions): AppContainer {
+  const { env } = options;
+  const logger = options.logger ?? createLogger({ name: 'autopilot', level: env.LOG_LEVEL });
+
+  const schedulerConfig: SchedulerConfig = {
+    ...DEFAULT_SCHEDULER_CONFIG,
+    timezone: env.SCHEDULER_TIMEZONE,
+    intervalMinutes: env.SCHEDULER_INTERVAL_MINUTES,
+    maxSlotsPerDay: env.SCHEDULER_MAX_SLOTS_PER_DAY,
+  };
+
+  /* --- Integrations (defaults are all credential-free mocks) --- */
+  const feedImporter = options.overrides?.feedImporter ?? new ShopeeFeedCsvImporter();
+
+  const imageGenerator =
+    options.overrides?.imageGenerator ??
+    (env.AI_IMAGE_PROVIDER === 'disabled'
+      ? new MockImageGenerator({ model: 'disabled' })
+      : new MockImageGenerator({ model: env.AI_IMAGE_MODEL }));
+
+  const captionGenerator =
+    options.overrides?.captionGenerator ??
+    (env.AI_TEXT_PROVIDER === 'disabled'
+      ? new MockCaptionGenerator({ model: 'disabled' })
+      : new MockCaptionGenerator({ model: env.AI_TEXT_MODEL }));
+
+  const storage =
+    options.overrides?.storage ??
+    new MemoryObjectStorage({ publicBaseUrl: env.S3_PUBLIC_BASE_URL });
+
+  // Part 1: publishers are constructed with a stub transport and allowLive=false,
+  // so no live Graph API call can occur regardless of credential presence.
+  const stubTransport = new StubGraphTransport({ id: 'stub-post-id' });
+  const facebookPublisher =
+    options.overrides?.facebookPublisher ??
+    new FacebookPagePublisher(
+      {
+        apiBase: env.FACEBOOK_GRAPH_API_BASE,
+        apiVersion: env.FACEBOOK_GRAPH_API_VERSION,
+        pageId: env.FACEBOOK_PAGE_ID,
+        pageAccessToken: env.FACEBOOK_PAGE_ACCESS_TOKEN,
+        allowLive: false,
+      },
+      stubTransport,
+    );
+
+  const threadsPublisher =
+    options.overrides?.threadsPublisher ??
+    new ThreadsPublisher(
+      {
+        apiBase: env.THREADS_API_BASE,
+        apiVersion: env.THREADS_API_VERSION,
+        userId: env.THREADS_USER_ID,
+        accessToken: env.THREADS_ACCESS_TOKEN,
+        allowLive: false,
+      },
+      stubTransport,
+    );
+
+  const telegramTransport = new MemoryTelegramTransport();
+  const notifier =
+    options.overrides?.notifier ??
+    new TelegramNotifier(
+      {
+        botToken: env.TELEGRAM_BOT_TOKEN,
+        chatId: env.TELEGRAM_CHAT_ID,
+        allowLive: false,
+      },
+      telegramTransport,
+    );
+
+  const queue = options.overrides?.queue ?? new InMemoryJobQueue();
+
+  const database = options.overrides?.database ?? createDatabaseHandle(env.DATABASE_URL);
+
+  const corsOrigins = parseCorsOrigins(env.CORS_ORIGINS);
+
+  const container: AppContainer = {
+    env,
+    logger,
+    database,
+    queue,
+    feedImporter,
+    imageGenerator,
+    captionGenerator,
+    storage,
+    facebookPublisher,
+    threadsPublisher,
+    notifier,
+    schedulerConfig,
+    corsOrigins,
+
+    schedulerStatus(now = new Date()) {
+      return describeSchedulerStatus(
+        schedulerConfig,
+        env.SCHEDULER_ENABLED === 'true',
+        env.SCHEDULER_MODE,
+        now,
+      );
+    },
+
+    integrationStatuses() {
+      // Merge env-derived status with the live adapters' own readiness notes.
+      const base = describeIntegrationStatus(env);
+      return base.map((status) => {
+        switch (status.service) {
+          case 'facebook_page':
+            return { ...status, detail: facebookPublisher.info.detail };
+          case 'threads':
+            return { ...status, detail: threadsPublisher.info.detail };
+          case 'telegram':
+            return { ...status, detail: notifier.info.detail };
+          case 's3_storage':
+            return { ...status, detail: storage.info.detail };
+          case 'ai_image':
+            return { ...status, detail: imageGenerator.info.detail };
+          case 'ai_text':
+            return { ...status, detail: captionGenerator.info.detail };
+          default:
+            return status;
+        }
+      });
+    },
+
+    readiness() {
+      const degradedReasons: string[] = [];
+      // The backend is READY if it can serve the APK. Missing optional
+      // integrations degrade specific features but do not make it unready.
+      if (env.SCHEDULER_ENABLED !== 'true') {
+        degradedReasons.push('Scheduler disabled — no automatic publishing will occur.');
+      }
+      if (!facebookPublisher.info.ready && !threadsPublisher.info.ready) {
+        degradedReasons.push('No publishing destination is live-configured.');
+      }
+      return { ready: true, degradedReasons };
+    },
+
+    async shutdown() {
+      await database.close();
+      logger.info({}, 'container shutdown complete');
+    },
+  };
+
+  return container;
+}

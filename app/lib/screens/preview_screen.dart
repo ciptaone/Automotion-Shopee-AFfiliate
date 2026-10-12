@@ -9,10 +9,12 @@ import '../widgets/common.dart';
 /// Content preview: product, 1- or 2-image layout, caption + hashtags,
 /// validation status and per-platform publication status.
 ///
-/// HONESTY: the generation pipeline does not exist yet, so the backend serves
-/// clearly-labelled FIXTURE content. The image count shown is the ONE count the
-/// backend selected for the slot — it is shared by Facebook and Threads and
-/// stays stable when the same slot is refreshed.
+/// HONESTY (Part 3): when the slot has a REAL pipeline record, this screen
+/// renders it — stage, generated images, providers (mock vs live) and
+/// blockers. When no pipeline record exists yet, the backend serves the Part 2
+/// clearly-labelled FIXTURE content and this screen labels it as such.
+/// Nothing here is ever published: the backend does not publish, and the
+/// terminal success stage is `publish_ready`.
 class PreviewScreen extends StatefulWidget {
   const PreviewScreen({super.key, required this.api, this.onSignedOut});
 
@@ -89,12 +91,16 @@ class _PreviewScreenState extends State<PreviewScreen> {
         physics: const AlwaysScrollableScrollPhysics(),
         padding: const EdgeInsets.all(16),
         children: [
-          FixtureBanner(
-            message: preview.note.isEmpty
-                ? 'Fixture content — nothing has been generated or published.'
-                : preview.note,
-          ),
+          if (preview.isPipeline)
+            _pipelineBanner(preview)
+          else
+            FixtureBanner(
+              message: preview.note.isEmpty
+                  ? 'Fixture content — nothing has been generated or published.'
+                  : preview.note,
+            ),
           if (_error != null) InlineErrorBanner(message: _error!, onRetry: _load),
+          if (preview.isPipeline) _pipelineCard(preview),
           _slotCard(preview),
           _productCard(preview),
           _imagesCard(preview),
@@ -104,6 +110,134 @@ class _PreviewScreenState extends State<PreviewScreen> {
           const SizedBox(height: 24),
         ],
       ),
+    );
+  }
+
+  /// Honest banner for REAL pipeline content: stage + provider kind.
+  Widget _pipelineBanner(ContentPreview preview) {
+    final scheme = Theme.of(context).colorScheme;
+    final stage = preview.stage;
+    final isReady = preview.publishReady;
+    final color = isReady
+        ? Colors.green
+        : (stage == PipelineStage.blocked || stage == PipelineStage.failed)
+            ? Colors.red
+            : scheme.primary;
+    final label = isReady
+        ? 'Real pipeline content — validated and ready to publish '
+            '(publication is still switched off).'
+        : stage == PipelineStage.blocked
+            ? 'Real pipeline content — BLOCKED. Nothing can be published.'
+            : stage == PipelineStage.failed
+                ? 'Real pipeline content — FAILED. Retry the slot.'
+                : 'Real pipeline content — stage: ${stage?.wireValue ?? 'unknown'}.';
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: color.withValues(alpha: 0.45)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(isReady ? Icons.verified_rounded : Icons.info_outline_rounded,
+              size: 18, color: color),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              label,
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: color, fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Stage, attempts, run id and exact blockers from the real pipeline record.
+  Widget _pipelineCard(ContentPreview preview) {
+    final scheme = Theme.of(context).colorScheme;
+    final stage = preview.stage;
+    final stageColor = preview.publishReady
+        ? Colors.green
+        : stage == PipelineStage.blocked || stage == PipelineStage.failed
+            ? Colors.red
+            : scheme.primary;
+    final imageProvider = preview.providers?.image;
+    final captionProvider = preview.providers?.caption;
+
+    return SectionCard(
+      title: 'Pipeline status',
+      icon: Icons.route_rounded,
+      trailing: StatusChip(
+        label: preview.publishReady
+            ? 'Publish ready'
+            : stage?.wireValue.replaceAll('_', ' ') ?? 'unknown',
+        color: stageColor,
+        icon: preview.publishReady
+            ? Icons.check_circle_rounded
+            : Icons.timelapse_rounded,
+      ),
+      children: [
+        KeyValueRow('Stage', stage?.wireValue ?? '—'),
+        KeyValueRow('Attempts', '${preview.attempts}'),
+        if (preview.generationRunId != null)
+          KeyValueRow('Run id', preview.generationRunId!),
+        KeyValueRow(
+          'Image provider',
+          imageProvider == null
+              ? '—'
+              : '${imageProvider.name} (${imageProvider.kind})',
+        ),
+        KeyValueRow(
+          'Caption provider',
+          captionProvider == null
+              ? '—'
+              : '${captionProvider.name} (${captionProvider.kind})',
+        ),
+        if (preview.usesMockProvider) ...[
+          const SizedBox(height: 8),
+          Text(
+            'Mock providers: content was generated by the built-in offline '
+            'mock, not a live AI service. No paid call was made.',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: const Color(0xFF9A6B00)),
+          ),
+        ],
+        if (preview.blockers.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text('Exact blockers:',
+              style: Theme.of(context)
+                  .textTheme
+                  .titleSmall
+                  ?.copyWith(fontWeight: FontWeight.w600)),
+          const SizedBox(height: 4),
+          for (final blocker in preview.blockers)
+            _IssueLine(
+              rule: blocker.code,
+              message: blocker.message,
+              color: scheme.error,
+            ),
+        ],
+        const SizedBox(height: 4),
+        Text(
+          preview.note.isEmpty
+              ? 'Generation only. The backend never publishes to Facebook or '
+                  'Threads in this part.'
+              : preview.note,
+          style: Theme.of(context)
+              .textTheme
+              .bodySmall
+              ?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+      ],
     );
   }
 
@@ -119,6 +253,12 @@ class _PreviewScreenState extends State<PreviewScreen> {
       ),
       children: [
         KeyValueRow('Slot', preview.slotKey),
+        KeyValueRow(
+          'Content source',
+          preview.isPipeline
+              ? 'Real pipeline record'
+              : 'Fixture (no pipeline record for this slot)',
+        ),
         KeyValueRow('Image policy', preview.imageCountPolicy.label),
         KeyValueRow('Selected count', '${preview.imageCount} (shared by both platforms)'),
         KeyValueRow('Selection source', preview.imageCountSource),
@@ -171,26 +311,45 @@ class _PreviewScreenState extends State<PreviewScreen> {
 
   Widget _imagesCard(ContentPreview preview) {
     final count = preview.imageCount;
+    final realImages = preview.images;
+    final scheme = Theme.of(context).colorScheme;
+
     return SectionCard(
       title: 'Images ($count)',
       icon: Icons.image_outlined,
       children: [
-        Wrap(
-          spacing: 12,
-          runSpacing: 12,
-          children: [
-            for (var i = 1; i <= count; i++) _ImagePlaceholder(index: i, total: count),
-          ],
-        ),
-        const SizedBox(height: 8),
-        Text(
-          'Placeholders: image generation is implemented on the backend in a later '
-          'part, so no generated image is shown here.',
-          style: Theme.of(context)
-              .textTheme
-              .bodySmall
-              ?.copyWith(color: Theme.of(context).colorScheme.outline),
-        ),
+        if (realImages.isNotEmpty) ...[
+          // REAL pipeline images: cURL-able URLs with checksums.
+          for (final image in realImages) _GeneratedImageTile(image: image),
+          const SizedBox(height: 8),
+          Text(
+            'Generated by ${preview.providers?.image?.name ?? 'pipeline'} '
+            '(${preview.providers?.image?.kind ?? 'unknown'}). Images are '
+            'validated structurally; visual fidelity to the product photo is '
+            'not machine-scored yet.',
+            style:
+                Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.outline),
+          ),
+        ] else ...[
+          Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            children: [
+              for (var i = 1; i <= count; i++)
+                _ImagePlaceholder(index: i, total: count),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            preview.isPipeline
+                ? 'No images were generated for this slot — see the blockers '
+                    'above for the exact reason.'
+                : 'Placeholders: no real pipeline record exists for this slot, '
+                    'so the backend served fixture content.',
+            style:
+                Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.outline),
+          ),
+        ],
       ],
     );
   }
@@ -237,6 +396,13 @@ class _PreviewScreenState extends State<PreviewScreen> {
               ? '—'
               : validation.platformsChecked.join(', '),
         ),
+        if (preview.isPipeline)
+          KeyValueRow(
+            'Publish gate',
+            preview.publishReady
+                ? 'PASSED — ready to publish (publication still off)'
+                : 'NOT PASSED — nothing may be published',
+          ),
         if (validation.blocking.isNotEmpty) ...[
           const SizedBox(height: 8),
           for (final issue in validation.blocking)
@@ -323,6 +489,97 @@ class _ImagePlaceholder extends StatelessWidget {
                 .labelSmall
                 ?.copyWith(color: scheme.outline),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+class _GeneratedImageTile extends StatelessWidget {
+  const _GeneratedImageTile({required this.image});
+
+  final PipelineImage image;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: AspectRatio(
+              aspectRatio: image.height > 0 ? image.width / image.height : 9 / 16,
+              child: Image.network(
+                image.publicUrl,
+                fit: BoxFit.cover,
+                errorBuilder: (context, error, stack) => Container(
+                  color: scheme.surfaceContainerHighest,
+                  alignment: Alignment.center,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.broken_image_outlined, color: scheme.outline),
+                      const SizedBox(height: 6),
+                      Text(
+                        'Image URL not reachable from this device.',
+                        style: Theme.of(context)
+                            .textTheme
+                            .bodySmall
+                            ?.copyWith(color: scheme.outline),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Image ${image.position} — ${image.view.replaceAll('_', ' ')}',
+            style: Theme.of(context)
+                .textTheme
+                .titleSmall
+                ?.copyWith(fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            '${image.width}×${image.height} · ${image.model} · '
+            'prompt ${image.promptVersion}',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: scheme.onSurfaceVariant),
+          ),
+          Text(
+            'sha256 ${image.checksumSha256.substring(0, 16)}… · '
+            '${image.isMock ? 'mock output' : 'live output'}',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: scheme.outline),
+          ),
+          if (image.referenceImageUrl != null) ...[
+            const SizedBox(height: 2),
+            Text(
+              'Grounded on reference: ${image.referenceImageUrl}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: scheme.outline, fontSize: 11),
+            ),
+          ],
         ],
       ),
     );

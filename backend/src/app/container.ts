@@ -31,6 +31,19 @@ import {
   type SettingsStore,
 } from '../settings/automation-settings.js';
 import { automationDegradedReasons } from '../automation/status.js';
+import {
+  FileCatalogStore,
+  InMemoryCatalogStore,
+  ProductCatalog,
+  type CatalogStore,
+} from '../catalog/catalog.js';
+import {
+  FileSlotStore,
+  InMemorySlotStore,
+  SlotContentStore,
+  type SlotStore,
+} from '../automation/slot-store.js';
+import { ContentPipeline } from '../automation/pipeline.js';
 import { createDatabaseHandle, type DatabaseHandle } from '../db/client.js';
 import { InMemoryJobQueue } from '../queue/job-queue.js';
 import { ShopeeFeedCsvImporter } from '../integrations/feed/shopee-feed-importer.js';
@@ -72,6 +85,12 @@ export interface AppContainer {
   readonly threadsPublisher: Publisher;
   readonly notifier: Notifier;
   readonly schedulerConfig: SchedulerConfig;
+  /** Persistent product catalog (Part 3). */
+  readonly catalog: ProductCatalog;
+  /** Per-slot content records: reservation, image count, assets, captions. */
+  readonly slots: SlotContentStore;
+  /** The real content pipeline (selection -> images -> captions -> gate). */
+  readonly pipeline: ContentPipeline;
   /** Scheduler config with the APK-managed interval/slot overrides applied. */
   effectiveSchedulerConfig(): SchedulerConfig;
   readonly corsOrigins: readonly string[];
@@ -93,6 +112,8 @@ export interface BuildContainerOptions {
   readonly overrides?: Partial<{
     queue: JobQueue;
     settingsStore: SettingsStore;
+    catalogStore: CatalogStore;
+    slotStore: SlotStore;
     feedImporter: ProductFeedImporter;
     imageGenerator: ImageGenerator;
     captionGenerator: CaptionGenerator;
@@ -132,6 +153,27 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
       : new FileSettingsStore(path.join(process.cwd(), 'data', 'settings.json')));
 
   const settings = new SettingsService(seededDefaults, settingsStore);
+
+  /* --- Catalog + slot content + pipeline (Part 3) --- */
+  // Like settings: file-backed persistence by default (verified here),
+  // in-memory under test. A PostgreSQL-backed store plugs in behind the same
+  // interfaces (schema in db/schema.ts, migration 0001_part3_catalog.sql).
+  const isTest = env.NODE_ENV === 'test';
+
+  const catalogStore: CatalogStore =
+    options.overrides?.catalogStore ??
+    (isTest
+      ? new InMemoryCatalogStore()
+      : new FileCatalogStore(path.join(process.cwd(), 'data', 'catalog.json')));
+
+  const slotStore: SlotStore =
+    options.overrides?.slotStore ??
+    (isTest
+      ? new InMemorySlotStore()
+      : new FileSlotStore(path.join(process.cwd(), 'data', 'slots.json')));
+
+  const catalog = new ProductCatalog(catalogStore);
+  const slots = new SlotContentStore(slotStore);
 
   /** Scheduler config as currently configured through the APK settings screen. */
   const currentSchedulerConfig = (): SchedulerConfig => {
@@ -209,6 +251,17 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
 
   const corsOrigins = parseCorsOrigins(env.CORS_ORIGINS);
 
+  /** The real content pipeline. Never publishes: live publishing is PART 4+. */
+  const pipeline = new ContentPipeline({
+    catalog,
+    slots,
+    settings,
+    imageGenerator,
+    captionGenerator,
+    storage,
+    notifier,
+  });
+
   const container: AppContainer = {
     env,
     logger,
@@ -223,6 +276,9 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     threadsPublisher,
     notifier,
     schedulerConfig,
+    catalog,
+    slots,
+    pipeline,
     effectiveSchedulerConfig: currentSchedulerConfig,
     corsOrigins,
 
@@ -266,6 +322,11 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
       if (current.automationState !== 'running') {
         degradedReasons.push(
           'Automation is paused - the backend stays up but publishes nothing until it is started.',
+        );
+      }
+      if (catalog.total() === 0) {
+        degradedReasons.push(
+          'The product catalog is empty: import a Shopee Affiliate feed before slots can generate content.',
         );
       }
       degradedReasons.push(

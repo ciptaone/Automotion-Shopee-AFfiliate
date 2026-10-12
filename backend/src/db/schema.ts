@@ -57,13 +57,25 @@ export const products = pgTable(
     marketplace: varchar('marketplace', { length: 64 }).notNull(),
     productUrl: text('product_url').notNull(),
     affiliateUrl: text('affiliate_url').notNull(),
+    /** False when the feed supplied no affiliate link (plain product URL). */
+    hasAffiliateLink: boolean('has_affiliate_link').notNull().default(false),
     price: doublePrecision('price'),
     currency: varchar('currency', { length: 16 }),
     commissionRate: doublePrecision('commission_rate'),
     imageUrl: text('image_url'),
     category: varchar('category', { length: 255 }),
+    /** Stable slug id derived from the category display name (Part 3). */
+    categoryId: varchar('category_id', { length: 64 }),
+    description: text('description'),
     rating: doublePrecision('rating'),
     soldCount: integer('sold_count'),
+    /** Catalog eligibility computed from imported fields only. */
+    eligible: boolean('eligible').notNull().default(false),
+    /** JSON array of machine-readable ineligibility reasons. */
+    eligibilityReasons: text('eligibility_reasons').notNull().default('[]'),
+    /** Unrecognized source columns, preserved verbatim as JSON. */
+    extraColumns: text('extra_columns').notNull().default('{}'),
+    lastImportedAt: timestamp('last_imported_at', { withTimezone: true }),
     /** Import batch identifier for traceability. */
     importBatchId: uuid('import_batch_id'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -73,6 +85,57 @@ export const products = pgTable(
     // One row per feed product; re-imports upsert rather than duplicate.
     uniqueIndex('products_feed_id_marketplace_idx').on(t.feedId, t.marketplace),
     index('products_import_batch_idx').on(t.importBatchId),
+    index('products_category_idx').on(t.categoryId),
+    index('products_eligible_idx').on(t.eligible),
+  ],
+);
+
+/* -------------------------------------------------------------------------- */
+/*  Slot content (Part 3: pipeline records)                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One row per content slot: the reserved product, the PERSISTED image count,
+ * the selection policy snapshot and the pipeline stage. Uniqueness on
+ * slot_key makes "two workers cannot reserve the same slot" a database
+ * invariant (mirrored by the in-process lock in the file/memory store).
+ */
+export const slotContents = pgTable(
+  'slot_contents',
+  {
+    id: uuid('id').primaryKey(),
+    slotKey: varchar('slot_key', { length: 64 }).notNull(),
+    stage: varchar('stage', { length: 32 }).notNull().default('reserved'),
+    productId: uuid('product_id').references(() => products.id, { onDelete: 'set null' }),
+    sourceProductId: varchar('source_product_id', { length: 255 }),
+    productName: text('product_name'),
+    affiliateUrl: text('affiliate_url'),
+    categoryId: varchar('category_id', { length: 64 }),
+    imageCountPolicy: varchar('image_count_policy', { length: 32 }).notNull().default('random_1_or_2'),
+    /** Chosen ONCE per slot, persisted BEFORE generation. */
+    imageCount: integer('image_count').notNull().default(1),
+    imageCountChosenAt: timestamp('image_count_chosen_at', { withTimezone: true }),
+    /** JSON snapshot of the selection policy + score signals. */
+    selection: text('selection').notNull().default('{}'),
+    referenceImageUrl: text('reference_url'),
+    generationRunId: varchar('generation_run_id', { length: 64 }),
+    /** JSON array of SlotAsset records (storage keys, checksums, prompts). */
+    assets: text('assets').notNull().default('[]'),
+    /** JSON array of SlotCaption records (per-platform text + validation). */
+    captions: text('captions').notNull().default('[]'),
+    validationPassed: boolean('validation_passed').notNull().default(false),
+    /** JSON array of SlotBlocker records. */
+    blockers: text('blockers').notNull().default('[]'),
+    lastError: text('last_error'),
+    attempts: integer('attempts').notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+  },
+  (t) => [
+    // The reservation uniqueness contract, enforced by the database.
+    uniqueIndex('slot_contents_slot_key_idx').on(t.slotKey),
+    index('slot_contents_stage_idx').on(t.stage),
   ],
 );
 

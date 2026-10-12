@@ -30,6 +30,9 @@ import type { ValidationIssue } from '../core/errors.js';
 export const IMAGE_COUNT_POLICIES = ['random_1_or_2', 'one', 'two'] as const;
 export type ImageCountPolicy = (typeof IMAGE_COUNT_POLICIES)[number];
 
+export const SELECTION_MODES = ['auto', 'selected_categories'] as const;
+export type SelectionMode = (typeof SELECTION_MODES)[number];
+
 export const AUTOMATION_STATES = ['running', 'paused'] as const;
 export type AutomationState = (typeof AUTOMATION_STATES)[number];
 
@@ -53,6 +56,10 @@ export interface AutomationSettings {
   readonly imageCountPolicy: ImageCountPolicy;
   readonly telegramNotificationsEnabled: boolean;
   readonly automationState: AutomationState;
+  /** Product selection mode (Part 3). Default: auto across all eligible categories. */
+  readonly selectionMode: SelectionMode;
+  /** Stable category ids from the imported catalog (only used in selected_categories mode). */
+  readonly selectedCategoryIds: readonly string[];
 }
 
 /** Everything EXCEPT the run state (state changes go through `control()`). */
@@ -67,6 +74,10 @@ export const DEFAULT_AUTOMATION_SETTINGS: AutomationSettings = {
   telegramNotificationsEnabled: true,
   // Honest default: nothing publishes until an operator explicitly starts it.
   automationState: 'paused',
+  // Locked decision (Part 3): products are selected across ALL eligible
+  // categories unless the operator explicitly narrows the selection.
+  selectionMode: 'auto',
+  selectedCategoryIds: [],
 };
 
 /** Machine-readable constraints, surfaced to the APK so it can validate offline. */
@@ -76,6 +87,7 @@ export const SETTINGS_CONSTRAINTS = {
   maxSlotsPerDay: MAX_SLOTS_PER_DAY,
   imageCountPolicies: IMAGE_COUNT_POLICIES,
   automationActions: AUTOMATION_ACTIONS,
+  selectionModes: SELECTION_MODES,
   slotsMustFitOneDay: true,
 } as const;
 
@@ -91,6 +103,12 @@ const settingsObjectSchema = z.object({
   imageCountPolicy: z.enum(IMAGE_COUNT_POLICIES),
   telegramNotificationsEnabled: z.boolean(),
   automationState: z.enum(AUTOMATION_STATES),
+  // Defaults keep pre-Part-3 persisted settings files loadable.
+  selectionMode: z.enum(SELECTION_MODES).default('auto'),
+  selectedCategoryIds: z
+    .array(z.string().trim().min(1).max(64))
+    .max(100)
+    .default([]),
 });
 
 const settingsSchema = settingsObjectSchema.superRefine((value, ctx) => {
@@ -99,6 +117,13 @@ const settingsSchema = settingsObjectSchema.superRefine((value, ctx) => {
       code: z.ZodIssueCode.custom,
       path: ['intervalMinutes'],
       message: `${value.maxSlotsPerDay} slot(s) every ${value.intervalMinutes} minute(s) exceed one 24-hour day; reduce the slot limit or the interval.`,
+    });
+  }
+  if (value.selectionMode === 'selected_categories' && value.selectedCategoryIds.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['selectedCategoryIds'],
+      message: 'Selected-categories mode requires at least one category id.',
     });
   }
 });

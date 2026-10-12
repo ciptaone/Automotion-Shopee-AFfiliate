@@ -28,6 +28,29 @@ enum AutomationState {
   }
 }
 
+/// How the backend picks which product feeds a content slot.
+enum SelectionMode {
+  /// Auto: across ALL eligible imported categories (the default).
+  auto('auto', 'Auto (all eligible categories)'),
+
+  /// Only within the operator's explicitly chosen categories.
+  selectedCategories(
+    'selected_categories',
+    'Selected categories only',
+  );
+
+  const SelectionMode(this.wireValue, this.label);
+  final String wireValue;
+  final String label;
+
+  static SelectionMode parse(String? raw) {
+    for (final value in SelectionMode.values) {
+      if (value.wireValue == raw) return value;
+    }
+    return SelectionMode.auto;
+  }
+}
+
 class AutomationSettings {
   const AutomationSettings({
     required this.intervalMinutes,
@@ -37,6 +60,8 @@ class AutomationSettings {
     required this.imageCountPolicy,
     required this.telegramNotificationsEnabled,
     required this.automationState,
+    required this.selectionMode,
+    required this.selectedCategoryIds,
   });
 
   /// Locked defaults, mirrored from the backend contract.
@@ -48,6 +73,8 @@ class AutomationSettings {
     imageCountPolicy: ImageCountPolicy.defaultValue,
     telegramNotificationsEnabled: true,
     automationState: AutomationState.paused,
+    selectionMode: SelectionMode.auto,
+    selectedCategoryIds: <String>[],
   );
 
   final int intervalMinutes;
@@ -57,6 +84,13 @@ class AutomationSettings {
   final ImageCountPolicy imageCountPolicy;
   final bool telegramNotificationsEnabled;
   final AutomationState automationState;
+
+  /// Product selection mode (Part 3): auto across all eligible categories, or
+  /// restricted to the operator's chosen categories.
+  final SelectionMode selectionMode;
+
+  /// Stable category ids from the imported catalog (selected-categories mode).
+  final List<String> selectedCategoryIds;
 
   factory AutomationSettings.fromJson(Map<String, dynamic> json) =>
       AutomationSettings(
@@ -69,6 +103,11 @@ class AutomationSettings {
         telegramNotificationsEnabled:
             json['telegramNotificationsEnabled'] as bool? ?? true,
         automationState: AutomationState.parse(json['automationState'] as String?),
+        selectionMode: SelectionMode.parse(json['selectionMode'] as String?),
+        selectedCategoryIds: (json['selectedCategoryIds'] as List?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            const [],
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -79,6 +118,8 @@ class AutomationSettings {
         'imageCountPolicy': imageCountPolicy.wireValue,
         'telegramNotificationsEnabled': telegramNotificationsEnabled,
         'automationState': automationState.wireValue,
+        'selectionMode': selectionMode.wireValue,
+        'selectedCategoryIds': selectedCategoryIds,
       };
 
   AutomationSettings copyWith({
@@ -89,6 +130,8 @@ class AutomationSettings {
     ImageCountPolicy? imageCountPolicy,
     bool? telegramNotificationsEnabled,
     AutomationState? automationState,
+    SelectionMode? selectionMode,
+    List<String>? selectedCategoryIds,
   }) =>
       AutomationSettings(
         intervalMinutes: intervalMinutes ?? this.intervalMinutes,
@@ -99,12 +142,25 @@ class AutomationSettings {
         telegramNotificationsEnabled:
             telegramNotificationsEnabled ?? this.telegramNotificationsEnabled,
         automationState: automationState ?? this.automationState,
+        selectionMode: selectionMode ?? this.selectionMode,
+        selectedCategoryIds:
+            selectedCategoryIds ?? this.selectedCategoryIds,
       );
 
   /// Client-side mirror of the backend's cross-field rule.
   String? get scheduleIssue {
     if (intervalMinutes * maxSlotsPerDay > 24 * 60) {
       return '$maxSlotsPerDay slots every $intervalMinutes minutes exceed one 24-hour day.';
+    }
+    return null;
+  }
+
+  /// Client-side mirror of the backend's selection rule: switching to
+  /// selected-categories mode requires at least one category.
+  String? get selectionIssue {
+    if (selectionMode == SelectionMode.selectedCategories &&
+        selectedCategoryIds.isEmpty) {
+      return 'Select at least one category before switching to selected-categories mode.';
     }
     return null;
   }
@@ -399,6 +455,14 @@ class ContentPreview {
     required this.validation,
     required this.facebook,
     required this.threads,
+    this.stage,
+    this.images = const [],
+    this.blockers = const [],
+    this.providers,
+    this.publishReady = false,
+    this.attempts = 0,
+    this.generationRunId,
+    this.updatedAt,
   });
 
   final String source;
@@ -415,7 +479,32 @@ class ContentPreview {
   final PreviewPlatformStatus facebook;
   final PreviewPlatformStatus threads;
 
+  /* --- Part 3 pipeline fields (absent on fixture payloads) --- */
+
+  /// Pipeline stage; null for fixture payloads.
+  final PipelineStage? stage;
+
+  /// Generated image assets (empty for fixtures).
+  final List<PipelineImage> images;
+
+  /// Machine-readable reasons the slot is blocked (empty when publish-ready).
+  final List<PipelineBlocker> blockers;
+
+  /// Honest provider summary (null for fixtures).
+  final PipelineProviders? providers;
+
+  /// True only when the REAL pipeline validated everything for publication.
+  final bool publishReady;
+  final int attempts;
+  final String? generationRunId;
+  final String? updatedAt;
+
   bool get isFixture => source == 'fixture';
+  bool get isPipeline => source == 'pipeline';
+
+  /// True when any provider behind this content was a mock (honesty badge).
+  bool get usesMockProvider =>
+      (providers?.image?.isMock ?? false) || (providers?.caption?.isMock ?? false);
 
   factory ContentPreview.fromJson(Map<String, dynamic> json) {
     final platforms = (json['platforms'] as Map<String, dynamic>?) ?? const {};
@@ -441,6 +530,26 @@ class ContentPreview {
       threads: PreviewPlatformStatus.fromJson(
         (platforms['threads'] as Map<String, dynamic>?) ?? const {},
       ),
+      stage: json['stage'] is String
+          ? PipelineStage.parse(json['stage'] as String)
+          : null,
+      images: (json['images'] as List?)
+              ?.whereType<Map<String, dynamic>>()
+              .map(PipelineImage.fromJson)
+              .toList() ??
+          const [],
+      blockers: (json['blockers'] as List?)
+              ?.whereType<Map<String, dynamic>>()
+              .map(PipelineBlocker.fromJson)
+              .toList() ??
+          const [],
+      providers: json['providers'] is Map<String, dynamic>
+          ? PipelineProviders.fromJson(json['providers'] as Map<String, dynamic>)
+          : null,
+      publishReady: json['publishReady'] as bool? ?? false,
+      attempts: (json['attempts'] as num?)?.toInt() ?? 0,
+      generationRunId: json['generationRunId'] as String?,
+      updatedAt: json['updatedAt'] as String?,
     );
   }
 }
@@ -590,4 +699,182 @@ class IntegrationHealthEntry {
         health: IntegrationHealth.parse(json['health'] as String?),
         healthDetail: json['healthDetail'] as String? ?? '',
       );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Product catalog (Part 3)                                                  */
+/* -------------------------------------------------------------------------- */
+
+/// A category derived from the ACTUAL imported catalog (never hardcoded).
+class CatalogCategory {
+  const CatalogCategory({
+    required this.id,
+    required this.name,
+    required this.productCount,
+    required this.eligibleProductCount,
+  });
+
+  final String id;
+  final String name;
+  final int productCount;
+  final int eligibleProductCount;
+
+  factory CatalogCategory.fromJson(Map<String, dynamic> json) => CatalogCategory(
+        id: json['id'] as String? ?? '',
+        name: json['name'] as String? ?? '',
+        productCount: (json['productCount'] as num?)?.toInt() ?? 0,
+        eligibleProductCount: (json['eligibleProductCount'] as num?)?.toInt() ?? 0,
+      );
+}
+
+class CatalogCategoriesPayload {
+  const CatalogCategoriesPayload({
+    required this.categories,
+    required this.count,
+    required this.total,
+    required this.note,
+  });
+
+  final List<CatalogCategory> categories;
+  final int count;
+  final int total;
+  final String note;
+
+  /// True when nothing has been imported yet (empty-catalog UX state).
+  bool get isEmpty => categories.isEmpty;
+
+  factory CatalogCategoriesPayload.fromJson(Map<String, dynamic> json) =>
+      CatalogCategoriesPayload(
+        categories: (json['categories'] as List?)
+                ?.whereType<Map<String, dynamic>>()
+                .map(CatalogCategory.fromJson)
+                .toList() ??
+            const [],
+        count: (json['count'] as num?)?.toInt() ?? 0,
+        total: (json['total'] as num?)?.toInt() ?? 0,
+        note: json['note'] as String? ?? '',
+      );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Content pipeline (Part 3)                                                 */
+/* -------------------------------------------------------------------------- */
+
+/// One generated image asset, as reported by the REAL pipeline.
+class PipelineImage {
+  const PipelineImage({
+    required this.position,
+    required this.view,
+    required this.publicUrl,
+    required this.width,
+    required this.height,
+    required this.sizeBytes,
+    required this.checksumSha256,
+    required this.provider,
+    required this.providerKind,
+    required this.model,
+    required this.promptVersion,
+    required this.referenceImageUrl,
+  });
+
+  final int position;
+  final String view;
+  final String publicUrl;
+  final int width;
+  final int height;
+  final int sizeBytes;
+  final String checksumSha256;
+  final String provider;
+
+  /// `"mock"` or `"live"` — the APK must never present a mock as a live run.
+  final String providerKind;
+  final String model;
+  final String promptVersion;
+  final String? referenceImageUrl;
+
+  bool get isMock => providerKind == 'mock';
+
+  factory PipelineImage.fromJson(Map<String, dynamic> json) => PipelineImage(
+        position: (json['position'] as num?)?.toInt() ?? 0,
+        view: json['view'] as String? ?? '',
+        publicUrl: json['publicUrl'] as String? ?? '',
+        width: (json['width'] as num?)?.toInt() ?? 0,
+        height: (json['height'] as num?)?.toInt() ?? 0,
+        sizeBytes: (json['sizeBytes'] as num?)?.toInt() ?? 0,
+        checksumSha256: json['checksumSha256'] as String? ?? '',
+        provider: json['provider'] as String? ?? '',
+        providerKind: json['providerKind'] as String? ?? '',
+        model: json['model'] as String? ?? '',
+        promptVersion: json['promptVersion'] as String? ?? '',
+        referenceImageUrl: json['referenceImageUrl'] as String?,
+      );
+}
+
+class PipelineBlocker {
+  const PipelineBlocker({required this.code, required this.message});
+
+  final String code;
+  final String message;
+
+  factory PipelineBlocker.fromJson(Map<String, dynamic> json) => PipelineBlocker(
+        code: json['code'] as String? ?? '',
+        message: json['message'] as String? ?? '',
+      );
+}
+
+/// Honest provider summary: which concrete generator produced the content.
+class PipelineProvider {
+  const PipelineProvider({required this.name, required this.kind});
+
+  final String name;
+  final String kind;
+
+  bool get isMock => kind == 'mock';
+
+  factory PipelineProvider.fromJson(Map<String, dynamic> json) => PipelineProvider(
+        name: json['name'] as String? ?? '',
+        kind: json['kind'] as String? ?? '',
+      );
+}
+
+class PipelineProviders {
+  const PipelineProviders({required this.image, required this.caption});
+
+  final PipelineProvider? image;
+  final PipelineProvider? caption;
+
+  factory PipelineProviders.fromJson(Map<String, dynamic> json) =>
+      PipelineProviders(
+        image: json['image'] is Map<String, dynamic>
+            ? PipelineProvider.fromJson(json['image'] as Map<String, dynamic>)
+            : null,
+        caption: json['caption'] is Map<String, dynamic>
+            ? PipelineProvider.fromJson(json['caption'] as Map<String, dynamic>)
+            : null,
+      );
+}
+
+/// Stage of the backend content pipeline for a slot.
+enum PipelineStage {
+  reserved('reserved'),
+  generatingImages('generating_images'),
+  imagesReady('images_ready'),
+  generatingCaptions('generating_captions'),
+  captionsReady('captions_ready'),
+  validated('validated'),
+  publishReady('publish_ready'),
+  blocked('blocked'),
+  failed('failed');
+
+  const PipelineStage(this.wireValue);
+  final String wireValue;
+
+  static PipelineStage parse(String? raw) {
+    for (final value in PipelineStage.values) {
+      if (value.wireValue == raw) return value;
+    }
+    return PipelineStage.reserved;
+  }
+
+  bool get isTerminal => this == publishReady || this == blocked || this == failed;
 }

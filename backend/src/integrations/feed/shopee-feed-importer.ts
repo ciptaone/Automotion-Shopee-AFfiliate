@@ -191,6 +191,17 @@ function buildProduct(
     cells[canonical] = header === undefined ? undefined : row.cells[header];
   }
 
+  // Preserve UNKNOWN source columns verbatim under their original header name,
+  // so a richer Shopee export never loses data we do not yet understand. The
+  // catalog stores them as `extraColumns` (never used to infer facts).
+  const mappedIndexes = new Set(fieldMap.keys());
+  const extraCells: Record<string, unknown> = {};
+  headers.forEach((header, index) => {
+    if (!mappedIndexes.has(index) && header && header.trim().length > 0) {
+      extraCells[header] = row.cells[header];
+    }
+  });
+
   const name = toText(cells['name']);
   const productUrl = toText(cells['productUrl']);
   const explicitId = toText(cells['id']);
@@ -240,7 +251,7 @@ function buildProduct(
     category: toText(cells['category']) || null,
     rating: toNumber(cells['rating']),
     soldCount: toNumber(cells['soldCount']),
-    raw: cells,
+    raw: { ...cells, ...extraCells },
   };
 
   return { product };

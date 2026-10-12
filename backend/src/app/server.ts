@@ -13,8 +13,15 @@
  *  - GET    /v1/settings             Authenticated. Automation settings + constraints.
  *  - PUT    /v1/settings             Authenticated (control). Validate + persist settings.
  *  - POST   /v1/automation/control   Authenticated (control). start | pause | resume.
- *  - GET    /v1/content/preview      Authenticated. FIXTURE preview of a content slot.
+ *  - GET    /v1/content/preview      Authenticated. REAL pipeline preview when the slot
+ *                                    has a record; Part 2 fixture fallback otherwise.
  *  - GET    /v1/history/publishes    Authenticated. FIXTURE publishing history.
+ *  - POST   /v1/catalog/import       Authenticated (control). Import a CSV/XLSX feed.
+ *  - GET    /v1/catalog              Authenticated. List catalog products (filterable).
+ *  - GET    /v1/catalog/categories   Authenticated. Categories from the actual catalog.
+ *  - GET    /v1/catalog/status       Authenticated. Catalog totals + recent imports.
+ *  - POST   /v1/pipeline/run         Authenticated (control). Generate content for a slot.
+ *  - GET    /v1/pipeline/slots       Authenticated. List pipeline slot records.
  *
  * Security invariants:
  *  - No endpoint ever returns a secret value; health/integration output is built
@@ -28,7 +35,7 @@ import cors from '@fastify/cors';
 import { z } from 'zod';
 import type { AppContainer } from '../app/container.js';
 import { verifyToken, requireScopes, type JwtClaims } from '../core/auth.js';
-import { AppError, AuthenticationError } from '../core/errors.js';
+import { AppError, AuthenticationError, ShopeeFeedError } from '../core/errors.js';
 import { redactDeep } from '../core/redact.js';
 import { InMemoryJobQueue } from '../queue/job-queue.js';
 import { withIntegrationHealth } from './integration-health.js';
@@ -39,10 +46,12 @@ import {
   FIXTURE_CONTENT_NOTE,
   FIXTURE_HISTORY_NOTE,
 } from '../automation/fixtures.js';
+import { buildPipelinePreview } from '../automation/pipeline-preview.js';
 import {
   AUTOMATION_ACTIONS,
   DEFAULT_AUTOMATION_SETTINGS,
   IMAGE_COUNT_POLICIES,
+  SELECTION_MODES,
   parseSettingsPatch,
   SETTINGS_CONSTRAINTS,
 } from '../settings/automation-settings.js';
@@ -68,10 +77,40 @@ const settingsPatchSchema = z
     threadsEnabled: z.boolean().optional(),
     imageCountPolicy: z.enum(IMAGE_COUNT_POLICIES).optional(),
     telegramNotificationsEnabled: z.boolean().optional(),
+    selectionMode: z.enum(SELECTION_MODES).optional(),
+    selectedCategoryIds: z.array(z.string().trim().min(1).max(64)).max(100).optional(),
   })
   .strict();
 
 const controlRequestSchema = z.object({ action: z.enum(AUTOMATION_ACTIONS) }).strict();
+
+/** Feed import: raw file bytes as base64 (multipart upload is a later part). */
+const catalogImportSchema = z
+  .object({
+    filename: z.string().trim().min(1).max(255),
+    /** Base64-encoded file content (CSV or XLSX bytes). */
+    contentBase64: z.string().min(1).max(40_000_000),
+    format: z.enum(['csv', 'xlsx']).optional(),
+    defaultMarketplace: z.string().trim().min(1).max(64).optional(),
+  })
+  .strict();
+
+const catalogListQuerySchema = z.object({
+  category: z.string().trim().min(1).max(64).optional(),
+  eligible: z.enum(['true', 'false']).optional(),
+  search: z.string().trim().max(200).optional(),
+  limit: z.string().optional(),
+  offset: z.string().optional(),
+});
+
+const pipelineRunSchema = z
+  .object({
+    /** Explicit slot key; defaults to the scheduler's next slot. */
+    slot: z.string().trim().min(1).max(64).optional(),
+    /** Explicit regeneration of derived artifacts (keeps reservation + count). */
+    regenerate: z.boolean().optional(),
+  })
+  .strict();
 
 /* -------------------------------------------------------------------------- */
 /*  Auth helper                                                               */
@@ -126,7 +165,7 @@ export async function buildServer(container: AppContainer): Promise<FastifyInsta
       }
       callback(null, container.corsOrigins.includes(origin));
     },
-    methods: ['GET', 'POST'],
+    methods: ['GET', 'POST', 'PUT'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     maxAge: 600,
   });
@@ -344,7 +383,47 @@ export async function buildServer(container: AppContainer): Promise<FastifyInsta
         },
       });
     }
-    const settings = await container.settings.update(parseSettingsPatch(parsed.data));
+    const patch = parseSettingsPatch(parsed.data);
+
+    // Cross-check category ids against the ACTUAL imported catalog: an
+    // unknown id in selected-categories mode would silently skip every slot.
+    if (patch.selectionMode === 'selected_categories' || patch.selectedCategoryIds) {
+      const merged = { ...container.settings.current(), ...patch };
+      if (merged.selectionMode === 'selected_categories') {
+        if (merged.selectedCategoryIds.length === 0) {
+          return reply.status(400).send({
+            error: {
+              code: 'INVALID_SETTINGS',
+              message: 'Selected-categories mode requires at least one category id.',
+              issues: redactDeep([
+                {
+                  rule: 'settings.selectedCategoryIds',
+                  message: 'Select at least one category before switching to selected-categories mode.',
+                },
+              ]),
+            },
+          });
+        }
+        const known = new Set(container.catalog.categories().map((category) => category.id));
+        const unknown = merged.selectedCategoryIds.filter((id) => !known.has(id));
+        if (unknown.length > 0) {
+          return reply.status(400).send({
+            error: {
+              code: 'INVALID_SETTINGS',
+              message: 'One or more selected category ids do not exist in the imported catalog.',
+              issues: redactDeep(
+                unknown.map((id) => ({
+                  rule: `settings.selectedCategoryIds.${id}`,
+                  message: `Category "${id}" is not in the catalog. Import a feed or refresh the category list.`,
+                })),
+              ),
+            },
+          });
+        }
+      }
+    }
+
+    const settings = await container.settings.update(patch);
     container.logger.info(
       { storage: container.settings.storageKind, intervalMinutes: settings.intervalMinutes },
       'automation settings updated',
@@ -390,7 +469,8 @@ export async function buildServer(container: AppContainer): Promise<FastifyInsta
   });
 
   /* ---------------------------------------------------------------------- */
-  /*  Authenticated: FIXTURE content preview + publishing history           */
+  /*  Authenticated: content preview (REAL pipeline when present, fixture   */
+  /*  fallback otherwise) + publishing history                              */
   /* ---------------------------------------------------------------------- */
 
   app.get('/v1/content/preview', async (request, reply) => {
@@ -400,8 +480,246 @@ export async function buildServer(container: AppContainer): Promise<FastifyInsta
     const scheduler = container.schedulerStatus();
     const slotKey =
       (query?.slot ?? '').trim() || scheduler.nextSlot?.key || `${scheduler.today}#01`;
+
+    // REAL pipeline record wins; the Part 2 fixture is the honest fallback
+    // while the pipeline has not run for this slot yet.
+    const record = container.pipeline.get(slotKey);
+    if (record) {
+      const preview = buildPipelinePreview({
+        record,
+        facebookEnabled: container.settings.current().facebookEnabled,
+        threadsEnabled: container.settings.current().threadsEnabled,
+      });
+      return reply.status(200).send(preview);
+    }
+
     const preview = buildContentPreview(slotKey, container.settings.current());
     return reply.status(200).send({ ...preview, note: FIXTURE_CONTENT_NOTE });
+  });
+
+  /* ---------------------------------------------------------------------- */
+  /*  Authenticated: product catalog (Part 3)                               */
+  /* ---------------------------------------------------------------------- */
+
+  app.post('/v1/catalog/import', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    const parsed = catalogImportSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: {
+          code: 'INVALID_REQUEST',
+          message: 'filename and contentBase64 are required; format must be csv or xlsx.',
+          issues: redactDeep(
+            parsed.error.issues.map((issue) => ({
+              rule: issue.path.length > 0 ? issue.path.join('.') : 'body',
+              message: issue.message,
+            })),
+          ),
+        },
+      });
+    }
+
+    let content: Uint8Array;
+    try {
+      content = new Uint8Array(Buffer.from(parsed.data.contentBase64, 'base64'));
+    } catch {
+      return reply.status(400).send({
+        error: { code: 'INVALID_REQUEST', message: 'contentBase64 is not valid base64.' },
+      });
+    }
+
+    try {
+      const result = await container.feedImporter.parse({
+        filename: parsed.data.filename,
+        content,
+        format: parsed.data.format,
+        defaultMarketplace: parsed.data.defaultMarketplace,
+      });
+      const batch = await container.catalog.importFeed(result, {
+        filename: parsed.data.filename,
+        format: result.summary.format,
+      });
+      container.logger.info(
+        {
+          batchId: batch.id,
+          newProducts: batch.newProducts,
+          updatedProducts: batch.updatedProducts,
+          rejected: batch.rejected,
+          urlDuplicatesSkipped: batch.urlDuplicatesSkipped,
+        },
+        'catalog import completed',
+      );
+      return reply.status(200).send({
+        batch,
+        catalog: {
+          total: container.catalog.total(),
+          eligible: container.catalog.count({ eligibleOnly: true }),
+          categories: container.catalog.categories().length,
+          storage: container.catalog.storageKind,
+        },
+        note: 'Imported into the persistent catalog. Previously valid products are never deleted by a failed or partial import.',
+      });
+    } catch (error) {
+      // A failed parse/import leaves the previous catalog fully intact.
+      // Feed-shape problems are the operator's to fix, so surface a safe,
+      // machine-readable code and message (never the internal context).
+      if (error instanceof ShopeeFeedError) {
+        const upstreamCode = (error.context as { upstreamCode?: string } | undefined)?.upstreamCode;
+        return reply.status(422).send({
+          error: {
+            code: upstreamCode ?? error.code,
+            message: error.message,
+            hint: 'The existing catalog was not modified by this failed import.',
+          },
+        });
+      }
+      if (error instanceof AppError && error.expose) {
+        return reply.status(error.httpStatus).send({
+          error: { code: error.code, message: error.message },
+        });
+      }
+      container.logger.error({ err: error }, 'catalog import failed');
+      return reply.status(500).send({
+        error: {
+          code: 'IMPORT_FAILED',
+          message: 'Feed import failed; the existing catalog was not modified.',
+        },
+      });
+    }
+  });
+
+  app.get('/v1/catalog', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['read']);
+    await container.catalog.init();
+    const query = catalogListQuerySchema.safeParse(request.query ?? {});
+    const params = query.success ? query.data : {};
+    const limit = params.limit ? Number.parseInt(params.limit, 10) : 50;
+    const offset = params.offset ? Number.parseInt(params.offset, 10) : 0;
+    const items = container.catalog.list({
+      categoryId: params.category,
+      eligibleOnly: params.eligible === 'true',
+      search: params.search,
+      limit: Number.isFinite(limit) ? limit : 50,
+      offset: Number.isFinite(offset) ? offset : 0,
+    });
+    return reply.status(200).send({
+      items,
+      count: items.length,
+      total: container.catalog.total(),
+      eligibleTotal: container.catalog.count({ eligibleOnly: true }),
+      storage: container.catalog.storageKind,
+      warning: container.catalog.warning,
+    });
+  });
+
+  app.get('/v1/catalog/categories', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['read']);
+    await container.catalog.init();
+    const categories = container.catalog.categories();
+    return reply.status(200).send({
+      categories,
+      count: categories.length,
+      total: container.catalog.total(),
+      note: 'Categories are derived from the ACTUAL imported catalog, not a hardcoded list.',
+    });
+  });
+
+  app.get('/v1/catalog/status', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['read']);
+    await container.catalog.init();
+    return reply.status(200).send({
+      total: container.catalog.total(),
+      eligible: container.catalog.count({ eligibleOnly: true }),
+      categories: container.catalog.categories().length,
+      storage: container.catalog.storageKind,
+      warning: container.catalog.warning,
+      recentImports: container.catalog.recentBatches(10),
+    });
+  });
+
+  /* ---------------------------------------------------------------------- */
+  /*  Authenticated: content pipeline (Part 3)                              */
+  /* ---------------------------------------------------------------------- */
+
+  app.post('/v1/pipeline/run', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    const parsed = pipelineRunSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: {
+          code: 'INVALID_REQUEST',
+          message: 'Body must be an object with optional slot (string) and regenerate (boolean).',
+        },
+      });
+    }
+    const scheduler = container.schedulerStatus();
+    const slotKey =
+      (parsed.data.slot ?? '').trim() || scheduler.nextSlot?.key || `${scheduler.today}#01`;
+
+    try {
+      const result = await container.pipeline.runSlot(slotKey, {
+        regenerate: parsed.data.regenerate === true,
+      });
+      const preview = buildPipelinePreview({
+        record: result.record,
+        facebookEnabled: container.settings.current().facebookEnabled,
+        threadsEnabled: container.settings.current().threadsEnabled,
+      });
+      container.logger.info(
+        {
+          slotKey,
+          stage: result.record.stage,
+          imageCount: result.record.imageCount,
+          attempts: result.record.attempts,
+          actions: result.actions,
+        },
+        'pipeline run completed',
+      );
+      return reply.status(200).send({
+        slotKey,
+        stage: result.record.stage,
+        actions: result.actions,
+        preview,
+        note: 'Content generation only: nothing is published to Facebook or Threads from this endpoint.',
+      });
+    } catch (error) {
+      container.logger.error({ err: error, slotKey }, 'pipeline run failed');
+      return reply.status(500).send({
+        error: { code: 'PIPELINE_FAILED', message: 'Pipeline run failed; see backend logs.' },
+      });
+    }
+  });
+
+  app.get('/v1/pipeline/slots', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['read']);
+    const limitRaw = (request.query as { limit?: string } | undefined)?.limit;
+    const limit = limitRaw ? Number.parseInt(limitRaw, 10) : 20;
+    const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 100) : 20;
+    const records = container.pipeline.list(safeLimit);
+    return reply.status(200).send({
+      slots: records.map((record) => ({
+        slotKey: record.slotKey,
+        stage: record.stage,
+        productName: record.productName,
+        imageCount: record.imageCount,
+        imageCountPolicy: record.imageCountPolicy,
+        assets: record.assets.length,
+        captions: record.captions.length,
+        validationPassed: record.validationPassed,
+        blockers: record.blockers,
+        attempts: record.attempts,
+        publishReady: record.stage === 'publish_ready',
+        updatedAt: record.updatedAt,
+      })),
+      count: records.length,
+      storage: container.slots.storageKind,
+    });
   });
 
   app.get('/v1/history/publishes', async (request, reply) => {

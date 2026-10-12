@@ -40,10 +40,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
   ImageCountPolicy _policy = ImageCountPolicy.defaultValue;
   AutomationState _state = AutomationState.paused;
 
+  /* --- Part 3: product selection -------------------------------------- */
+  SelectionMode _selectionMode = SelectionMode.auto;
+  final List<String> _selectedCategoryIds = <String>[];
+  List<CatalogCategory> _categories = const [];
+  bool _categoriesLoading = true;
+  String? _categoriesError;
+
   @override
   void initState() {
     super.initState();
     _load();
+    _loadCategories();
   }
 
   @override
@@ -95,6 +103,48 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _telegramEnabled = settings.telegramNotificationsEnabled;
     _policy = settings.imageCountPolicy;
     _state = settings.automationState;
+    _selectionMode = settings.selectionMode;
+    _selectedCategoryIds
+      ..clear()
+      ..addAll(settings.selectedCategoryIds);
+    // If the catalog categories are already loaded, drop any selection ids
+    // that no longer exist (the backend would reject them on save anyway).
+    if (_categories.isNotEmpty) {
+      final known = _categories.map((c) => c.id).toSet();
+      _selectedCategoryIds.removeWhere((id) => !known.contains(id));
+    }
+  }
+
+  /// Loads the categories that ACTUALLY exist in the imported catalog.
+  /// Empty catalog => empty list + friendly guidance (never a hardcoded list).
+  Future<void> _loadCategories() async {
+    setState(() {
+      _categoriesLoading = true;
+      _categoriesError = null;
+    });
+    try {
+      final payload = await widget.api.fetchCatalogCategories();
+      if (!mounted) return;
+      setState(() {
+        _categories = payload.categories;
+        _categoriesLoading = false;
+      });
+      // Drop ids that no longer exist in the catalog so we never send an
+      // invalid selection to the backend (covers categories loading after
+      // the settings payload).
+      if (_selectedCategoryIds.isNotEmpty) {
+        final known = payload.categories.map((c) => c.id).toSet();
+        _selectedCategoryIds.removeWhere((id) => !known.contains(id));
+      }
+    } on AuthException {
+      widget.onSignedOut?.call();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _categoriesLoading = false;
+        _categoriesError = e.message;
+      });
+    }
   }
 
   void _markDirty() {
@@ -122,6 +172,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
       });
       return;
     }
+    // Local mirror of the backend rule: selected-categories needs categories.
+    if (_selectionMode == SelectionMode.selectedCategories &&
+        _selectedCategoryIds.isEmpty) {
+      setState(() {
+        _issues = const [
+          'Select at least one category, or switch back to Auto.',
+        ];
+        _error = null;
+      });
+      return;
+    }
 
     setState(() {
       _saving = true;
@@ -136,6 +197,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       'threadsEnabled': _threadsEnabled,
       'imageCountPolicy': _policy.wireValue,
       'telegramNotificationsEnabled': _telegramEnabled,
+      'selectionMode': _selectionMode.wireValue,
+      'selectedCategoryIds': _selectionMode == SelectionMode.auto
+          ? <String>[]
+          : List<String>.unmodifiable(_selectedCategoryIds),
     };
 
     try {
@@ -270,6 +335,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             InlineErrorBanner(message: 'Settings rejected:\n${_issues.join('\n')}'),
           _controlCard(),
           _scheduleCard(),
+          _selectionCard(),
           _destinationsCard(),
           _contentCard(),
           _notificationsCard(),
@@ -383,6 +449,170 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ],
       ],
     );
+  }
+
+  Widget _selectionCard() {
+    final scheme = Theme.of(context).colorScheme;
+    final usingSelected = _selectionMode == SelectionMode.selectedCategories;
+
+    return SectionCard(
+      title: 'Product selection',
+      icon: Icons.category_rounded,
+      children: [
+        Text(
+          'Choose which imported products the backend may pick from when it '
+          'creates content for a slot.',
+          style: Theme.of(context)
+              .textTheme
+              .bodySmall
+              ?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+        const SizedBox(height: 12),
+        SegmentedButton<SelectionMode>(
+          segments: [
+            for (final mode in SelectionMode.values)
+              ButtonSegment(value: mode, label: Text(mode.label)),
+          ],
+          selected: {_selectionMode},
+          showSelectedIcon: false,
+          onSelectionChanged: (selection) {
+            setState(() => _selectionMode = selection.first);
+            _markDirty();
+          },
+        ),
+        const SizedBox(height: 4),
+        if (!usingSelected)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Text(
+              'Auto uses weighted scoring across every eligible imported '
+              'category, with category diversity and recent-product avoidance. '
+              'It makes no sales predictions.',
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          )
+        else
+          ..._categoryPicker(scheme),
+      ],
+    );
+  }
+
+  List<Widget> _categoryPicker(ColorScheme scheme) {
+    if (_categoriesLoading) {
+      return [
+        const SizedBox(height: 12),
+        const LinearProgressIndicator(),
+        const SizedBox(height: 8),
+        Text(
+          'Loading categories from the imported catalog…',
+          style: Theme.of(context)
+              .textTheme
+              .bodySmall
+              ?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+      ];
+    }
+
+    if (_categoriesError != null) {
+      return [
+        const SizedBox(height: 12),
+        InlineErrorBanner(message: 'Categories failed to load: $_categoriesError'),
+        TextButton.icon(
+          onPressed: _loadCategories,
+          icon: const Icon(Icons.refresh_rounded, size: 18),
+          label: const Text('Retry'),
+        ),
+      ];
+    }
+
+    if (_categories.isEmpty) {
+      return [
+        const SizedBox(height: 12),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'No categories yet — the catalog is empty.',
+                style: Theme.of(context)
+                    .textTheme
+                    .titleSmall
+                    ?.copyWith(fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Import a Shopee affiliate feed first (backend endpoint '
+                'POST /v1/catalog/import). Categories are derived from the '
+                'actual imported products — this app never invents a list.',
+                style: Theme.of(context)
+                    .textTheme
+                    .bodySmall
+                    ?.copyWith(color: scheme.onSurfaceVariant),
+              ),
+            ],
+          ),
+        ),
+      ];
+    }
+
+    return [
+      const SizedBox(height: 8),
+      Text(
+        'Pick one or more categories (only these will be used):',
+        style: Theme.of(context)
+            .textTheme
+            .bodySmall
+            ?.copyWith(color: scheme.onSurfaceVariant),
+      ),
+      const SizedBox(height: 4),
+      for (final category in _categories)
+        CheckboxListTile(
+          contentPadding: EdgeInsets.zero,
+          dense: true,
+          controlAffinity: ListTileControlAffinity.leading,
+          title: Text(category.name),
+          subtitle: Text(
+            '${category.eligibleProductCount} eligible of '
+            '${category.productCount} imported',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: scheme.onSurfaceVariant),
+          ),
+          value: _selectedCategoryIds.contains(category.id),
+          onChanged: (checked) {
+            setState(() {
+              if (checked == true) {
+                _selectedCategoryIds.add(category.id);
+              } else {
+                _selectedCategoryIds.remove(category.id);
+              }
+            });
+            _markDirty();
+          },
+        ),
+      if (_selectedCategoryIds.isEmpty)
+        Padding(
+          padding: const EdgeInsets.only(top: 4),
+          child: Text(
+            'No category selected — slots will be skipped (never silently '
+            'switched back to Auto).',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: scheme.error),
+          ),
+        ),
+    ];
   }
 
   Widget _destinationsCard() {

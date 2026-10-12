@@ -4,15 +4,19 @@ Always-on backend + Flutter Android control app for automated, validated
 Shopee-affiliate content publishing to **Facebook Page** and **Threads**, with
 **Telegram** notifications.
 
-> **Part 2 status: CONTROL SURFACE READY, PIPELINE NOT WIRED.** Parts 1–2
-> deliver the verified foundation (auth, scheduler, queue, integration
-> contracts) plus the Flutter control surface (dashboard, automation settings,
-> content preview, publishing history, integrations). The full automation
-> workflow (feed → AI image/caption → validation → publish → notify) is
-> intentionally **not** wired end-to-end yet; preview/history responses are
-> explicitly **fixture-tagged**. Every third-party integration runs behind a
-> deterministic mock or a hard "live disabled" latch, so **no real post,
-> message, or paid API call can occur** from this codebase as-is.
+> **Part 3 status: CATALOG + REAL CONTENT PIPELINE (NO PUBLICATION).** Parts
+> 1–3 deliver the verified foundation (auth, scheduler, queue, integration
+> contracts), the Flutter control surface, a **persistent product catalog**
+> with idempotent feed import, the **Auto / Selected-Categories selection
+> policy**, and the **real content pipeline** (product reservation → persisted
+> image count → grounded image generation → validation → caption → publish
+> gate → `publish_ready`). The pipeline **generates and validates** content but
+> **never publishes**: the publisher is not invoked, and every third-party
+> integration still runs behind a deterministic mock or a hard "live disabled"
+> latch, so **no real post, message, or paid API call can occur** from this
+> codebase as-is. Live Shopee feed ingestion and the PostgreSQL store remain
+> explicitly **BLOCKED** (no official contract / no database in this
+> environment).
 
 ---
 
@@ -84,8 +88,18 @@ npm run dev                 # http://localhost:8080
 | GET | `/v1/settings` | JWT | Current automation settings + effective scheduler config. |
 | PUT | `/v1/settings` | JWT | Update interval/slots/platform toggles/image policy (validated). |
 | POST | `/v1/automation/control` | JWT | Start / pause / resume automation (idempotent). |
-| GET | `/v1/content/preview?slot=` | JWT | Latest content preview for a slot (fixture-tagged until the pipeline exists). |
-| GET | `/v1/history/publishes` | JWT | Recent publish history (fixture-tagged until the pipeline exists). |
+| GET | `/v1/content/preview?slot=` | JWT | Slot preview: real pipeline record when one exists, otherwise the PART 2 fixture. |
+| GET | `/v1/history/publishes` | JWT | Recent publish history (fixture-tagged until publishing is enabled). |
+| POST | `/v1/catalog/import` | JWT + control | Import a CSV/XLSX Shopee feed (idempotent; failed imports never destroy the catalog). |
+| GET | `/v1/catalog` | JWT | List catalog products (`category=`, `eligible=` filters). |
+| GET | `/v1/catalog/categories` | JWT | Categories derived from the ACTUAL imported catalog. |
+| GET | `/v1/catalog/status` | JWT | Catalog totals, storage kind and recent import batches. |
+| POST | `/v1/pipeline/run` | JWT + control | Run the content pipeline for a slot (generation only — never publishes). |
+| GET | `/v1/pipeline/slots` | JWT | Slot records: stage, image count, validation, exact blockers. |
+
+`PUT /v1/settings` additionally accepts `selectionMode`
+(`auto` | `selected_categories`) and `selectedCategoryIds`; unknown category
+ids and empty selections are rejected.
 
 ### Environment variables
 
@@ -122,9 +136,9 @@ in the Android Keystore. **The app never contains provider secrets.**
 
 ---
 
-## Database / migrations (optional in Part 1)
+## Database / migrations (optional)
 
-The schema is defined with Drizzle ORM. The migration is committed for review.
+The schema is defined with Drizzle ORM. Migrations are committed for review.
 
 ```bash
 cd backend
@@ -132,22 +146,26 @@ npm run db:generate      # regenerate SQL from src/db/schema.ts
 # npm run db:migrate     # requires a live DATABASE_URL + drizzle-kit
 ```
 
-Without `DATABASE_URL` the backend runs fully in-memory (job queue + storage are
-mocks) and `/health` reports Postgres as `not_configured`.
+Without `DATABASE_URL` the backend persists settings, catalog and slot content
+to **file-backed stores** under `backend/data/` (`settings.json`,
+`catalog.json`, `slots.json` — gitignored, atomic writes) and runs the job
+queue/storage as mocks; `/health` reports Postgres as `not_configured`. The
+PostgreSQL catalog/slot schema (`0001_part3_catalog.sql`) is written but
+**not applied** in this environment (no database available).
 
 ---
 
 ## Testing
 
 ```bash
-cd backend && npm test       # 214 unit + contract tests (all offline)
-cd app && flutter test       # 8 model-parsing tests
+cd backend && npm test       # 412 unit + contract tests (all offline)
+cd app && flutter test       # 137 model + widget tests (all offline)
 ```
 
 All tests are **credential-free and offline**. They never send a Telegram
 message, publish to Facebook/Threads, or call a paid AI/S3 API. Blocked items
-(e.g. live Shopee feed, live S3, live publish) are documented in
-[`docs/implementation/part-01-evidence.md`](docs/implementation/part-01-evidence.md).
+(e.g. live Shopee feed, live S3, live publish, PostgreSQL) are documented in
+[`docs/implementation/part-03-evidence.md`](docs/implementation/part-03-evidence.md).
 
 ---
 
@@ -158,6 +176,9 @@ message, publish to Facebook/Threads, or call a paid AI/S3 API. Blocked items
 | [`docs/implementation/part-01-repository-audit.md`](docs/implementation/part-01-repository-audit.md) | Initial state, toolchain, constraints, architecture decision. |
 | [`docs/implementation/part-01-integration-feasibility.md`](docs/implementation/part-01-integration-feasibility.md) | Per-service official requirements, auth, quotas, blockers. |
 | [`docs/implementation/part-01-evidence.md`](docs/implementation/part-01-evidence.md) | Test-by-test evidence ledger with PASS/FAIL/BLOCKED. |
+| [`docs/implementation/part-02-evidence.md`](docs/implementation/part-02-evidence.md) | Flutter control-surface evidence (dashboard, settings, preview, history). |
+| [`docs/implementation/part-03-audit.md`](docs/implementation/part-03-audit.md) | PART 3 starting-state audit: capabilities, gaps, non-breaking contracts. |
+| [`docs/implementation/part-03-evidence.md`](docs/implementation/part-03-evidence.md) | Catalog, selection policy and content-pipeline evidence with live smoke test. |
 
 ---
 

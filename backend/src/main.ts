@@ -48,7 +48,7 @@ async function main(): Promise<void> {
       schedulerEnabled: env.SCHEDULER_ENABLED === 'true',
       schedulerTimezone: env.SCHEDULER_TIMEZONE,
     },
-    'starting Shopee Affiliate Autopilot backend (Part 1: foundation)',
+    'starting Shopee Affiliate Autopilot backend (Part 3: catalog + content pipeline)',
   );
 
   /* --- 3. Container --- */
@@ -67,6 +67,19 @@ async function main(): Promise<void> {
       warning: container.settings.loadWarning,
     },
     'automation settings loaded',
+  );
+
+  /* --- 3c. Product catalog + slot content store (Part 3) --- */
+  await container.catalog.init();
+  await container.slots.init();
+  logger.info(
+    {
+      catalogStorage: container.catalog.storageKind,
+      products: container.catalog.total(),
+      categories: container.catalog.categories().length,
+      warning: container.catalog.warning,
+    },
+    'product catalog loaded',
   );
 
   /* --- 4. Server --- */

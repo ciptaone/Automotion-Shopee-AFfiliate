@@ -12,6 +12,7 @@
  * docs/implementation/part-01-integration-feasibility.md for the evaluation plan.
  */
 import { deflateSync } from 'node:zlib';
+import { MANDATORY_FINAL_HASHTAGS } from '../../contracts/index.js';
 import type {
   CaptionGenerationRequest,
   CaptionGenerator,
@@ -208,11 +209,14 @@ export interface MockCaptionGeneratorOptions {
  *  - moderate emoji,
  *  - a clear CTA,
  *  - relevant hashtags,
- *  - the affiliate link embedded verbatim.
+ *  - the affiliate link embedded verbatim,
+ *  - an affiliate DISCLOSURE in the body (Part 4),
+ *  - the MANDATORY `#ai #automation` ending, with nothing after (Part 4).
  *
  * It NEVER fabricates benefits, testimonials, discounts, usage experiences or
  * commission values: every descriptive clause is drawn only from fields present
- * on the product record. When a field is missing, that clause is omitted.
+ * on the product record. When a field is missing, that clause is omitted. It is
+ * also first-person-FREE: no ownership/receipt/usage/endorsement claims.
  */
 export class MockCaptionGenerator implements CaptionGenerator {
   readonly info: ProviderInfo;
@@ -264,10 +268,15 @@ export class MockCaptionGenerator implements CaptionGenerator {
 
     const cta = 'Klik linknya, cek langsung di Shopee. 👉';
 
+    // Part 4: a mandatory affiliate disclosure in the BODY (not just a hashtag).
+    const disclosure = 'Link di bawah adalah link afiliasi.';
+
     const hashtags = buildHashtags(product);
     const linkLine = affiliateUrl;
+    // Part 4: the caption MUST end exactly with `#ai #automation`, nothing after.
+    const ending = MANDATORY_FINAL_HASHTAGS;
 
-    const fullText = [hook, body, cta, hashtags.join(' '), linkLine]
+    const fullText = [hook, body, cta, disclosure, hashtags.join(' '), linkLine, ending]
       .filter((s) => s.trim().length > 0)
       .join('\n\n');
 

@@ -344,7 +344,16 @@ class AutomationStatus {
 /* -------------------------------------------------------------------------- */
 
 class ContentProduct {
-  const ContentProduct({required this.name, required this.affiliateUrl, required this.source});
+  const ContentProduct({
+    required this.name,
+    required this.affiliateUrl,
+    required this.source,
+    this.sourceProductId,
+    this.categoryId,
+    this.referenceImageUrl,
+    this.referenceAvailable,
+    this.referenceUnavailableReason,
+  });
 
   final String name;
   final String affiliateUrl;
@@ -352,24 +361,170 @@ class ContentProduct {
   /// `fixture` until the real pipeline exists.
   final String source;
 
+  /* --- PART 4: product record is the source of truth --- */
+
+  /// Marketplace id of the reserved product (null on fixtures).
+  final String? sourceProductId;
+  final String? categoryId;
+
+  /// Reference image the generation was grounded on (null when none).
+  final String? referenceImageUrl;
+
+  /// PART 4 — whether a reference image is available for this product.
+  ///
+  /// `null` means the backend did not report it (Part 2 fixture payloads);
+  /// the UI must not claim availability either way in that case.
+  final bool? referenceAvailable;
+
+  /// Why generation is blocked when [referenceAvailable] is false.
+  final String? referenceUnavailableReason;
+
+  bool get referenceMissing => referenceAvailable == false;
+
   factory ContentProduct.fromJson(Map<String, dynamic> json) => ContentProduct(
         name: json['name'] as String? ?? '',
         affiliateUrl: json['affiliateUrl'] as String? ?? '',
         source: json['source'] as String? ?? '',
+        sourceProductId: json['sourceProductId'] as String?,
+        categoryId: json['categoryId'] as String?,
+        referenceImageUrl: json['referenceImageUrl'] as String?,
+        referenceAvailable: json['referenceAvailable'] as bool?,
+        referenceUnavailableReason: json['referenceUnavailableReason'] as String?,
       );
 }
 
 class ContentCaption {
-  const ContentCaption({required this.fullText, required this.hashtags, required this.source});
+  const ContentCaption({
+    required this.fullText,
+    required this.hashtags,
+    required this.source,
+    this.mandatoryFinalHashtags,
+    this.mandatoryEndingPresent,
+  });
 
   final String fullText;
   final List<String> hashtags;
   final String source;
 
+  /* --- PART 4: mandatory editorial ending --- */
+
+  /// Exact required tail (e.g. `#ai #automation`); null on fixtures.
+  final String? mandatoryFinalHashtags;
+
+  /// Whether the canonical caption really ends with it (null on fixtures).
+  final bool? mandatoryEndingPresent;
+
+  bool get hasMandatoryEnding => mandatoryEndingPresent == true;
+
   factory ContentCaption.fromJson(Map<String, dynamic> json) => ContentCaption(
         fullText: json['fullText'] as String? ?? '',
         hashtags: (json['hashtags'] as List?)?.map((e) => e.toString()).toList() ?? const [],
         source: json['source'] as String? ?? '',
+        mandatoryFinalHashtags: json['mandatoryFinalHashtags'] as String?,
+        mandatoryEndingPresent: json['mandatoryEndingPresent'] as bool?,
+      );
+}
+
+/* -------------------------------------------------------------------------- */
+/*  PART 4 — editorial policy + image-quality reports                         */
+/* -------------------------------------------------------------------------- */
+
+/// Structured result of the mandatory editorial policy (no first-person
+/// claims, disclosure present, mandatory `#ai #automation` ending, no
+/// fabricated prices/discounts/benefits).
+class EditorialReport {
+  const EditorialReport({
+    required this.source,
+    required this.passed,
+    required this.mandatoryFinalHashtags,
+    required this.mandatoryEndingPresent,
+    required this.disclosurePresent,
+    required this.blocking,
+    required this.warnings,
+    required this.limitations,
+  });
+
+  final String source;
+  final bool passed;
+  final String mandatoryFinalHashtags;
+  final bool mandatoryEndingPresent;
+  final bool disclosurePresent;
+  final List<ValidationIssueModel> blocking;
+  final List<ValidationIssueModel> warnings;
+
+  /// Honest scope statement: heuristic detection, not a human review.
+  final String limitations;
+
+  factory EditorialReport.fromJson(Map<String, dynamic> json) => EditorialReport(
+        source: json['source'] as String? ?? '',
+        passed: json['passed'] as bool? ?? false,
+        mandatoryFinalHashtags: json['mandatoryFinalHashtags'] as String? ?? '',
+        mandatoryEndingPresent: json['mandatoryEndingPresent'] as bool? ?? false,
+        disclosurePresent: json['disclosurePresent'] as bool? ?? false,
+        blocking: (json['blocking'] as List?)
+                ?.whereType<Map<String, dynamic>>()
+                .map(ValidationIssueModel.fromJson)
+                .toList() ??
+            const [],
+        warnings: (json['warnings'] as List?)
+                ?.whereType<Map<String, dynamic>>()
+                .map(ValidationIssueModel.fromJson)
+                .toList() ??
+            const [],
+        limitations: json['limitations'] as String? ?? '',
+      );
+}
+
+/// A dimension that was deliberately NOT scored, with the honest reason.
+class QualityDimension {
+  const QualityDimension({required this.dimension, required this.reason});
+
+  final String dimension;
+  final String reason;
+
+  factory QualityDimension.fromJson(Map<String, dynamic> json) => QualityDimension(
+        dimension: json['dimension'] as String? ?? '',
+        reason: json['reason'] as String? ?? '',
+      );
+}
+
+/// Structural image-quality result. [automatedFidelityScore] is ALWAYS null:
+/// no vision scorer exists, so a successful generation never proves the image
+/// depicts the correct product.
+class ImageQualityReport {
+  const ImageQualityReport({
+    required this.source,
+    required this.passed,
+    required this.automatedFidelityScore,
+    required this.limitations,
+    required this.notAssessed,
+    required this.blocking,
+  });
+
+  final String source;
+  final bool passed;
+
+  /// Always null — never fabricated by the backend or the APK.
+  final int? automatedFidelityScore;
+  final String limitations;
+  final List<QualityDimension> notAssessed;
+  final List<ValidationIssueModel> blocking;
+
+  factory ImageQualityReport.fromJson(Map<String, dynamic> json) => ImageQualityReport(
+        source: json['source'] as String? ?? '',
+        passed: json['passed'] as bool? ?? false,
+        automatedFidelityScore: (json['automatedFidelityScore'] as num?)?.toInt(),
+        limitations: json['limitations'] as String? ?? '',
+        notAssessed: (json['notAssessed'] as List?)
+                ?.whereType<Map<String, dynamic>>()
+                .map(QualityDimension.fromJson)
+                .toList() ??
+            const [],
+        blocking: (json['blocking'] as List?)
+                ?.whereType<Map<String, dynamic>>()
+                .map(ValidationIssueModel.fromJson)
+                .toList() ??
+            const [],
       );
 }
 
@@ -463,6 +618,8 @@ class ContentPreview {
     this.attempts = 0,
     this.generationRunId,
     this.updatedAt,
+    this.editorial,
+    this.imageQuality,
   });
 
   final String source;
@@ -498,6 +655,14 @@ class ContentPreview {
   final int attempts;
   final String? generationRunId;
   final String? updatedAt;
+
+  /* --- Part 4 editorial + image-quality reports (null on fixtures) --- */
+
+  /// Structured editorial policy result (never bypassed for the schedule).
+  final EditorialReport? editorial;
+
+  /// Structural image-quality result; fidelity score is always null there.
+  final ImageQualityReport? imageQuality;
 
   bool get isFixture => source == 'fixture';
   bool get isPipeline => source == 'pipeline';
@@ -550,6 +715,12 @@ class ContentPreview {
       attempts: (json['attempts'] as num?)?.toInt() ?? 0,
       generationRunId: json['generationRunId'] as String?,
       updatedAt: json['updatedAt'] as String?,
+      editorial: json['editorial'] is Map<String, dynamic>
+          ? EditorialReport.fromJson(json['editorial'] as Map<String, dynamic>)
+          : null,
+      imageQuality: json['imageQuality'] is Map<String, dynamic>
+          ? ImageQualityReport.fromJson(json['imageQuality'] as Map<String, dynamic>)
+          : null,
     );
   }
 }

@@ -853,3 +853,234 @@ describe('PART 3 honesty guarantees', () => {
     }
   });
 });
+
+/* ========================================================================== */
+/*  PART 4 — editorial, image quality, reference binding (preview contract)   */
+/* ========================================================================== */
+
+describe('PART 4 preview contract — editorial + image quality + reference', () => {
+  it('exposes the editorial policy result with the mandatory ending', async () => {
+    const { app } = await createApp();
+    try {
+      await importFeed(app, [row('1', 'Health & Beauty')]);
+      await app.inject({
+        method: 'POST',
+        url: '/v1/pipeline/run',
+        headers: auth(),
+        payload: { slot: '2026-10-12#18' },
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: '/v1/content/preview?slot=2026-10-12%2318',
+        headers: auth(),
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+
+      expect(body.editorial.source).toBe('editorial_policy');
+      expect(body.editorial.passed).toBe(true);
+      expect(body.editorial.mandatoryFinalHashtags).toBe('#ai #automation');
+      expect(body.editorial.mandatoryEndingPresent).toBe(true);
+      expect(body.editorial.disclosurePresent).toBe(true);
+      expect(body.editorial.blocking).toEqual([]);
+      expect(body.editorial.limitations).toMatch(/not a substitute for human/i);
+
+      // The caption itself ends exactly with the locked hashtags, nothing after.
+      expect(body.caption.mandatoryFinalHashtags).toBe('#ai #automation');
+      expect(body.caption.mandatoryEndingPresent).toBe(true);
+      expect(body.caption.fullText.trimEnd().endsWith('#ai #automation')).toBe(true);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('exposes image-quality status WITHOUT ever claiming a fidelity score', async () => {
+    const { app } = await createApp();
+    try {
+      await importFeed(app, [row('1', 'Health & Beauty')]);
+      await app.inject({
+        method: 'POST',
+        url: '/v1/pipeline/run',
+        headers: auth(),
+        payload: { slot: '2026-10-12#19' },
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: '/v1/content/preview?slot=2026-10-12%2319',
+        headers: auth(),
+      });
+      const body = res.json();
+
+      expect(body.imageQuality.source).toBe('structural_image_quality');
+      expect(body.imageQuality.passed).toBe(true);
+      // No vision scorer exists, so the score is ALWAYS null with a reason.
+      expect(body.imageQuality.automatedFidelityScore).toBeNull();
+      expect(body.imageQuality.limitations).toMatch(/structural checks only|does not verify/i);
+      expect(body.imageQuality.notAssessed.length).toBeGreaterThan(0);
+      for (const entry of body.imageQuality.notAssessed) {
+        expect(entry.dimension).toBeTruthy();
+        expect(entry.reason).toBeTruthy();
+      }
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('reports reference-image availability explicitly (never silent)', async () => {
+    const { app } = await createApp();
+    try {
+      // No reference image → the selection gate blocks instead of guessing.
+      await importFeed(app, [row('1', 'Health & Beauty', '')]);
+      await app.inject({
+        method: 'POST',
+        url: '/v1/pipeline/run',
+        headers: auth(),
+        payload: { slot: '2026-10-12#20' },
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: '/v1/content/preview?slot=2026-10-12%2320',
+        headers: auth(),
+      });
+      const body = res.json();
+
+      expect(body.product.referenceAvailable).toBe(false);
+      expect(body.product.referenceUnavailableReason).toBeTruthy();
+      expect(body.stage).toBe('blocked');
+      expect(body.publishReady).toBe(false);
+      expect(body.blockers.length).toBeGreaterThan(0);
+      expect(body.blockers[0].message).toBeTruthy();
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('a publish_ready preview reports reference availability as true', async () => {
+    const { app } = await createApp();
+    try {
+      await importFeed(app, [row('1', 'Health & Beauty')]);
+      await app.inject({
+        method: 'POST',
+        url: '/v1/pipeline/run',
+        headers: auth(),
+        payload: { slot: '2026-10-12#21' },
+      });
+      const res = await app.inject({
+        method: 'GET',
+        url: '/v1/content/preview?slot=2026-10-12%2321',
+        headers: auth(),
+      });
+      const body = res.json();
+      expect(body.product.referenceAvailable).toBe(true);
+      expect(body.product.referenceUnavailableReason).toBeNull();
+      expect(body.images.length).toBeGreaterThan(0);
+      for (const image of body.images) {
+        expect(image.providerKind).toBe('mock');
+        expect(image.promptVersion).toBeTruthy();
+      }
+    } finally {
+      await app.close();
+    }
+  });
+});
+
+/* ========================================================================== */
+/*  PART 4 — scheduler → pipeline integration surface                         */
+/* ========================================================================== */
+
+describe('PART 4 scheduler contract — scheduler → queue → pipeline', () => {
+  it('GET /v1/scheduler/status reports the content scheduler block additively', async () => {
+    const { app } = await createApp();
+    try {
+      const res = await app.inject({
+        method: 'GET',
+        url: '/v1/scheduler/status',
+        headers: auth(),
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json();
+
+      // PART 1/2 keys are untouched.
+      expect(body).toHaveProperty('enabled');
+      expect(body).toHaveProperty('mode');
+      expect(body).toHaveProperty('timezone');
+      expect(body).toHaveProperty('intervalMinutes');
+      expect(body).toHaveProperty('maxSlotsPerDay');
+      expect(body).toHaveProperty('today');
+      expect(body).toHaveProperty('slotsToday');
+      expect(body).toHaveProperty('nextSlot');
+
+      // PART 4 additive block.
+      expect(body.contentScheduler.connected).toBe(true);
+      expect(body.contentScheduler.jobKind).toBe('content_slot');
+      expect(body.contentScheduler.publishing).toBe('disabled');
+      expect(body.contentScheduler.loop).toHaveProperty('enabled');
+      expect(body.contentScheduler.loop).toHaveProperty('tickIntervalMs');
+      expect(body.contentScheduler.loop).toHaveProperty('reason');
+      expect(body.contentScheduler.lastTick).toBeNull(); // no tick yet
+      expect(body.contentScheduler.note).toMatch(/never invokes/i);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('surfaces the last tick once the content scheduler has run', async () => {
+    const { app, container } = await createApp();
+    try {
+      // Start automation, then run ONE tick with the container's own clock.
+      await app.inject({
+        method: 'POST',
+        url: '/v1/automation/control',
+        headers: auth(),
+        payload: { action: 'start' },
+      });
+      const tick = await container.contentScheduler.tick();
+      expect(tick.today).toBeTruthy();
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/v1/scheduler/status',
+        headers: auth(),
+      });
+      const last = res.json().contentScheduler.lastTick;
+      expect(last).not.toBeNull();
+      expect(last.at).toBe(tick.at);
+      expect(last.today).toBe(tick.today);
+      expect(last.enqueued).toEqual(tick.enqueued);
+      expect(last.executed).toEqual(tick.executed);
+      expect(last.skipped).toEqual(tick.skipped);
+      expect(last.pendingJobs).toBe(tick.pendingJobs);
+      expect(last.message).toBe(tick.message);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('the queue exposes content-slot jobs under the persistent identity', async () => {
+    const { app, container } = await createApp();
+    try {
+      await app.inject({
+        method: 'POST',
+        url: '/v1/automation/control',
+        headers: auth(),
+        payload: { action: 'start' },
+      });
+      const tick = await container.contentScheduler.tick();
+
+      const res = await app.inject({
+        method: 'GET',
+        url: '/v1/queue/jobs?limit=50',
+        headers: auth(),
+      });
+      expect(res.statusCode).toBe(200);
+      const jobs = res.json().jobs as Array<{ kind: string; uniqueKey: string; status: string }>;
+      const contentJobs = jobs.filter((j) => j.kind === 'content_slot');
+      expect(contentJobs).toHaveLength(tick.enqueued.length);
+      for (const job of contentJobs) {
+        expect(job.uniqueKey.startsWith('content:')).toBe(true);
+      }
+    } finally {
+      await app.close();
+    }
+  });
+});

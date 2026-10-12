@@ -17,8 +17,8 @@
  * the catalog, with the same honesty rule: the file store is the verified
  * path here; a PostgreSQL-backed store is BLOCKED (no database available).
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import path from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { atomicWriteText, createSerialQueue } from '../core/atomic-file.js';
 import { AppError } from '../core/errors.js';
 import type { ImageCountPolicy } from '../settings/automation-settings.js';
 import type { SelectionMode } from './selection.js';
@@ -164,7 +164,12 @@ export class SlotStoreError extends AppError {
   }
 }
 
-/** Atomic file store (temp write + rename), same crash-safety as settings. */
+/**
+ * Atomic file store: unique temp write + rename, with writes for one instance
+ * serialized so a later snapshot can never be clobbered by an older one
+ * (same crash-safety as settings/catalog, now also safe against concurrent
+ * scheduler + API writes).
+ */
 export class FileSlotStore implements SlotStore {
   readonly kind = 'file' as const;
 
@@ -195,16 +200,19 @@ export class FileSlotStore implements SlotStore {
   }
 
   async save(snapshot: SlotStoreSnapshot): Promise<void> {
-    const dir = path.dirname(this.filePath);
-    const tmp = `${this.filePath}.tmp`;
-    try {
-      await mkdir(dir, { recursive: true });
-      await writeFile(tmp, `${JSON.stringify(snapshot)}\n`, 'utf8');
-      await rename(tmp, this.filePath);
-    } catch (error) {
-      throw new SlotStoreError(`Could not write slot store ${this.filePath}`, error);
-    }
+    // Serialize writes for this store instance: a snapshot built later must
+    // never be overwritten by an older one (the slot store is written by the
+    // scheduler tick and by API-triggered runs at the same time).
+    await this.queue(async () => {
+      try {
+        await atomicWriteText(this.filePath, `${JSON.stringify(snapshot)}\n`);
+      } catch (error) {
+        throw new SlotStoreError(`Could not write slot store ${this.filePath}`, error);
+      }
+    });
   }
+
+  private readonly queue = createSerialQueue();
 }
 
 /* -------------------------------------------------------------------------- */

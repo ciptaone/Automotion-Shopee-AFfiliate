@@ -38,6 +38,7 @@ import { verifyToken, requireScopes, type JwtClaims } from '../core/auth.js';
 import { AppError, AuthenticationError, ShopeeFeedError } from '../core/errors.js';
 import { redactDeep } from '../core/redact.js';
 import { InMemoryJobQueue } from '../queue/job-queue.js';
+import { CONTENT_JOB_KIND } from '../scheduler/content-scheduler.js';
 import { withIntegrationHealth } from './integration-health.js';
 import { describeAutomationStatus } from '../automation/status.js';
 import {
@@ -306,7 +307,34 @@ export async function buildServer(container: AppContainer): Promise<FastifyInsta
   app.get('/v1/scheduler/status', async (request, reply) => {
     authenticate(container, request);
     requireScopes(claimsOf(request), ['read']);
-    return reply.status(200).send(container.schedulerStatus());
+    // Part 4: additive `contentScheduler` block describing the
+    // scheduler -> queue -> pipeline integration. Every Part 1/2 key of
+    // SchedulerStatus is preserved unchanged.
+    const status = container.schedulerStatus();
+    const lastTick = container.contentScheduler.peekLastTick();
+    return reply.status(200).send({
+      ...status,
+      contentScheduler: {
+        connected: true,
+        loop: container.schedulerLoopStatus(),
+        jobKind: CONTENT_JOB_KIND,
+        maxCatchUpPerTick: container.contentScheduler.catchUpLimit,
+        lastTick: lastTick
+          ? {
+              at: lastTick.at,
+              today: lastTick.today,
+              enqueued: lastTick.enqueued,
+              executed: lastTick.executed,
+              skipped: lastTick.skipped,
+              failed: lastTick.failed,
+              pendingJobs: lastTick.pendingJobs,
+              message: lastTick.message,
+            }
+          : null,
+        publishing: 'disabled',
+        note: 'Executes the content pipeline to publish_ready only; never invokes Facebook/Threads publishers.',
+      },
+    });
   });
 
   app.get('/v1/queue/jobs', async (request, reply) => {

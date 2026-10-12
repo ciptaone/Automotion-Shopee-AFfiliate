@@ -41,6 +41,18 @@ const SECRET_VALUE_PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
     'url_credential_query',
     /[?&](access_token|token|api_key|apikey|key|signature|sig|secret|client_secret)=([^&\s"']+)/gi,
   ],
+  // OpenAI-style bare API keys (sk-...) appearing anywhere in free text
+  ['openai_style_key', /\bsk-[A-Za-z0-9_-]{20,}\b/g],
+  // Credential assignments in free text (provider error messages):
+  //   api_key=..., token: ..., password=..., secret=...
+  // No capture groups on purpose — the whole match is masked, which fails
+  // closed if the shape ever changes. `&` is excluded so a query string keeps
+  // its remaining params, and the lookahead keeps an already-redacted
+  // `access_token=[REDACTED]` (from the pattern above) byte-for-byte intact.
+  [
+    'credential_assignment',
+    /\b(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|client[_-]?secret|bot[_-]?token|password|passwd|token|secret)[=:]\s*(?!\[REDACTED\])[^\s"',;&)]{8,}/gi,
+  ],
 ];
 
 /** Maximum string length retained for any redacted field, to keep logs bounded. */

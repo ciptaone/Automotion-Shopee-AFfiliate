@@ -316,3 +316,50 @@ describe('seededRandom / slotSeed', () => {
     expect(slotSeed('2026-10-12#01')).not.toBe(slotSeed('2026-10-12#02'));
   });
 });
+
+/* ========================================================================== */
+/*  PART 4 — score ties resolve on STABLE identity (determinism regression)   */
+/* ========================================================================== */
+
+describe('selectProduct — tie-break determinism across catalog instances', () => {
+  // Two products with IDENTICAL scores (same signals): the tie must be broken
+  // by marketplace + sourceProductId, never by `internalId`, which is a fresh
+  // random UUID per catalog load.
+  const tiedCatalog = (idPrefix: string): CatalogProduct[] => [
+    product({ internalId: `${idPrefix}-uuid-a`, sourceProductId: '1' }),
+    product({
+      internalId: `${idPrefix}-uuid-b`,
+      sourceProductId: '2',
+      categoryId: 'home-living',
+      category: 'Home & Living',
+    }),
+  ];
+
+  const choose = (products: CatalogProduct[]): string => {
+    const outcome = selectProduct(products, {
+      policy: { mode: 'auto', selectedCategoryIds: [], requireReferenceImage: true },
+      random: seededRandom(slotSeed('2026-10-12#10')),
+      recentProductIds: [],
+      recentCategoryIds: [],
+    });
+    expect(outcome.status).toBe('selected');
+    return outcome.status === 'selected' ? outcome.product.sourceProductId : 'none';
+  };
+
+  it('picks the SAME source product regardless of per-instance UUIDs', () => {
+    // The UUID prefixes deliberately sort in the OPPOSITE order to the source
+    // ids, so any tie-break on internalId would flip the choice.
+    const first = choose(tiedCatalog('zzz'));
+    const second = choose(tiedCatalog('aaa'));
+    expect(first).toBe(second);
+    expect(first).toBe('1'); // stable order: lowest marketplace:sourceId wins
+  });
+
+  it('stays stable across many independently built catalogs', () => {
+    const results = new Set<string>();
+    for (let i = 0; i < 30; i += 1) {
+      results.add(choose(tiedCatalog(`instance-${i}`)));
+    }
+    expect([...results]).toEqual(['1']);
+  });
+});

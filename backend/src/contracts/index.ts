@@ -13,6 +13,14 @@
 /*  Shared primitives                                                         */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * PART 4 locked editorial contract: every FINAL caption must end exactly with
+ * these two hashtags, in this order, with no text or hashtags after them.
+ * Enforced by `pipeline/editorial-policy.ts` at the publish gate.
+ */
+export const MANDATORY_FINAL_HASHTAGS = '#ai #automation' as const;
+export const MANDATORY_FINAL_HASHTAG_TOKENS = ['#ai', '#automation'] as const;
+
 /** Identifies the concrete implementation behind a contract, for health/logs. */
 export type ProviderKind = 'mock' | 'live';
 
@@ -103,6 +111,12 @@ export interface ImageGenerationRequest {
   readonly model?: string;
   /** Hard cap on generation latency; providers should fail fast past this. */
   readonly timeoutMs?: number;
+  /**
+   * Cooperative cancellation (Part 4): the resilience runner aborts on timeout;
+   * live adapters that support cancellation MUST honor this signal, mocks may
+   * ignore it.
+   */
+  readonly signal?: AbortSignal;
 }
 
 export interface GeneratedImage {
@@ -134,6 +148,38 @@ export interface CaptionGenerationRequest {
   readonly model?: string;
   readonly seed?: number;
   readonly timeoutMs?: number;
+  /** Cooperative cancellation (Part 4); see ImageGenerationRequest.signal. */
+  readonly signal?: AbortSignal;
+  /**
+   * PART 4 — bounded regeneration. When > 1, this is a retry driven by
+   * validation feedback; `previousIssues` carries the EXACT rules the previous
+   * output failed so the generator can correct them (never regenerate blind).
+   */
+  readonly regenerationAttempt?: number;
+  readonly previousIssues?: readonly CaptionIssueFeedback[];
+  /**
+   * PART 4 — the editorial contract the generator MUST honor (mandatory final
+   * hashtags, no first-person ownership/experience claims, disclosure). The
+   * backend re-validates every output; passing the brief does not bypass the
+   * publish gate.
+   */
+  readonly editorialBrief?: CaptionEditorialBrief;
+}
+
+/** A validation rule a previous caption attempt failed (for regeneration). */
+export interface CaptionIssueFeedback {
+  readonly rule: string;
+  readonly message: string;
+}
+
+/** Editorial constraints handed to caption generators (Part 4). */
+export interface CaptionEditorialBrief {
+  /** Caption MUST end with exactly these hashtags, in this order. */
+  readonly mandatoryFinalHashtags: readonly string[];
+  /** Human-readable restatement of the claim policy for prompt grounding. */
+  readonly claimPolicy: string;
+  /** Required affiliate-disclosure phrasing hint. */
+  readonly disclosureHint: string;
 }
 
 export interface GeneratedCaption {

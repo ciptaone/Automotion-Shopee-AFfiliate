@@ -44,10 +44,11 @@ import {
   type SlotStore,
 } from '../automation/slot-store.js';
 import { ContentPipeline } from '../automation/pipeline.js';
+import { ContentScheduler } from '../scheduler/content-scheduler.js';
 import { createDatabaseHandle, type DatabaseHandle } from '../db/client.js';
 import { InMemoryJobQueue } from '../queue/job-queue.js';
 import { ShopeeFeedCsvImporter } from '../integrations/feed/shopee-feed-importer.js';
-import { MockCaptionGenerator, MockImageGenerator } from '../integrations/ai/mock-ai.js';
+import { createCaptionGenerator, createImageGenerator } from '../integrations/ai/create-ai.js';
 import { MemoryObjectStorage } from '../integrations/storage/object-storage.js';
 import {
   FacebookPagePublisher,
@@ -91,11 +92,20 @@ export interface AppContainer {
   readonly slots: SlotContentStore;
   /** The real content pipeline (selection -> images -> captions -> gate). */
   readonly pipeline: ContentPipeline;
+  /** Scheduler -> queue -> pipeline loop (Part 4). Runs while the APK is closed. */
+  readonly contentScheduler: ContentScheduler;
   /** Scheduler config with the APK-managed interval/slot overrides applied. */
   effectiveSchedulerConfig(): SchedulerConfig;
   readonly corsOrigins: readonly string[];
 
   schedulerStatus(now?: Date): SchedulerStatus;
+  /** Part 4: whether the scheduler -> pipeline timer loop is enabled by env. */
+  schedulerLoopStatus(): {
+    enabled: boolean;
+    mode: string;
+    tickIntervalMs: number;
+    reason: string;
+  };
   integrationStatuses(): IntegrationStatus[];
   /** Aggregate readiness used by /health. */
   readiness(): {
@@ -188,17 +198,22 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
   /* --- Integrations (defaults are all credential-free mocks) --- */
   const feedImporter = options.overrides?.feedImporter ?? new ShopeeFeedCsvImporter();
 
+  // Part 4: AI providers resolve through an HONEST factory. `mock`/`disabled`
+  // give deterministic offline mocks (wrapped in the resilience layer: timeout,
+  // bounded retries, rate-limit handling, usage accounting, redacted logging).
+  // A configured-but-unimplemented live vendor (openai/google) returns an
+  // UNAVAILABLE adapter that fails fast and reports ready:false — it NEVER
+  // silently degrades to mock output while claiming a live provider.
+  const aiLogger = {
+    info: (fields: Record<string, unknown>, message: string) => logger.info(fields, message),
+    warn: (fields: Record<string, unknown>, message: string) => logger.warn(fields, message),
+    error: (fields: Record<string, unknown>, message: string) => logger.error(fields, message),
+  };
   const imageGenerator =
-    options.overrides?.imageGenerator ??
-    (env.AI_IMAGE_PROVIDER === 'disabled'
-      ? new MockImageGenerator({ model: 'disabled' })
-      : new MockImageGenerator({ model: env.AI_IMAGE_MODEL }));
+    options.overrides?.imageGenerator ?? createImageGenerator(env, { logger: aiLogger });
 
   const captionGenerator =
-    options.overrides?.captionGenerator ??
-    (env.AI_TEXT_PROVIDER === 'disabled'
-      ? new MockCaptionGenerator({ model: 'disabled' })
-      : new MockCaptionGenerator({ model: env.AI_TEXT_MODEL }));
+    options.overrides?.captionGenerator ?? createCaptionGenerator(env, { logger: aiLogger });
 
   const storage =
     options.overrides?.storage ??
@@ -251,7 +266,7 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
 
   const corsOrigins = parseCorsOrigins(env.CORS_ORIGINS);
 
-  /** The real content pipeline. Never publishes: live publishing is PART 4+. */
+  /** The real content pipeline. Never publishes: live publishing stays disabled. */
   const pipeline = new ContentPipeline({
     catalog,
     slots,
@@ -260,6 +275,15 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     captionGenerator,
     storage,
     notifier,
+  });
+
+  /** Part 4: scheduler -> queue -> pipeline. Never publishes; reaches publish_ready only. */
+  const contentScheduler = new ContentScheduler({
+    queue,
+    pipeline,
+    settings,
+    schedulerConfig: currentSchedulerConfig,
+    logger,
   });
 
   const container: AppContainer = {
@@ -279,6 +303,7 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     catalog,
     slots,
     pipeline,
+    contentScheduler,
     effectiveSchedulerConfig: currentSchedulerConfig,
     corsOrigins,
 
@@ -289,6 +314,22 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
         env.SCHEDULER_MODE,
         now,
       );
+    },
+
+    schedulerLoopStatus() {
+      // Mirrors the loop started in main.ts. The interval is a poll cadence;
+      // the actual slot cadence comes from settings.intervalMinutes.
+      const enabled = env.SCHEDULER_ENABLED === 'true' && env.SCHEDULER_MODE !== 'disabled';
+      return {
+        enabled,
+        mode: env.SCHEDULER_MODE,
+        tickIntervalMs: 60_000,
+        reason: enabled
+          ? 'Loop runs in-process: scheduler -> queue -> pipeline (independent of the APK).'
+          : env.SCHEDULER_ENABLED !== 'true'
+            ? 'SCHEDULER_ENABLED is not "true".'
+            : 'SCHEDULER_MODE is "disabled".',
+      };
     },
 
     integrationStatuses() {

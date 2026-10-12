@@ -32,20 +32,30 @@
 import { randomUUID } from 'node:crypto';
 import type {
   CaptionGenerator,
+  CaptionEditorialBrief,
   FeedProduct,
+  GeneratedCaption,
   GeneratedImage,
   ImageGenerator,
   Notifier,
   ObjectStorage,
 } from '../contracts/index.js';
+import { MANDATORY_FINAL_HASHTAGS } from '../contracts/index.js';
 import type { ProductCatalog, CatalogProduct } from '../catalog/catalog.js';
 import type { SettingsService, AutomationSettings } from '../settings/automation-settings.js';
 import { validateCaption, blocksPublish } from '../pipeline/content-validation.js';
+import {
+  evaluateEditorialPolicy,
+  editorialToValidationIssues,
+} from '../pipeline/editorial-policy.js';
 import { evaluateImageQuality, sha256 } from './image-quality.js';
 import { buildImagePrompt, type ImageView } from './image-prompt.js';
 import { seededRandom, selectProduct, slotSeed, type SelectionPolicy } from './selection.js';
 import type { SlotAsset, SlotBlocker, SlotCaption, SlotContentRecord, SlotStage } from './slot-store.js';
 import { SlotContentStore } from './slot-store.js';
+
+/** PART 4 — bounded caption regeneration attempts when validation fails. */
+export const MAX_CAPTION_ATTEMPTS = 3;
 
 /* -------------------------------------------------------------------------- */
 /*  Composition root for the pipeline                                         */
@@ -162,7 +172,10 @@ export class ContentPipeline {
     actions: string[],
   ): Promise<SlotContentRecord> {
     const { catalog, slots } = this.deps;
-    return slots.mutate(slotKey, (current) => {
+    // The mapper runs under the per-key lock AND may be async, so the write
+    // below is part of the same atomic reservation: no other worker can
+    // observe a half-reserved slot.
+    return slots.mutate(slotKey, async (current) => {
       if (current) {
         return current; // another worker reserved first
       }
@@ -217,7 +230,12 @@ export class ContentPipeline {
         // The slot is recorded as BLOCKED with the exact reason. It is NEVER
         // silently re-selected under a different policy. The caller notifies
         // the operator through the normal blocked-stage path.
-        return {
+        //
+        // Persisting here matters (Part 4): `runSlot` returns a terminal
+        // record untouched, so without this write the block would live only on
+        // the stack — the scheduler could not see it (no skip, no "no eligible
+        // product" reason) and a restart would re-reserve the slot.
+        const blocked: SlotContentRecord = {
           ...base,
           stage: 'blocked' as SlotStage,
           productId: null,
@@ -229,10 +247,12 @@ export class ContentPipeline {
           referenceImageUrl: null,
           blockers: [{ code: outcome.code, message: outcome.message }],
         };
+        await slots.put(blocked);
+        return blocked;
       }
 
       const product = outcome.product;
-      return {
+      const reserved: SlotContentRecord = {
         ...base,
         stage: 'reserved' as SlotStage,
         productId: product.internalId,
@@ -249,6 +269,8 @@ export class ContentPipeline {
           considered: outcome.considered,
         },
       };
+      await slots.put(reserved);
+      return reserved;
     });
   }
 
@@ -267,6 +289,47 @@ export class ContentPipeline {
       updatedAt: now,
       completedAt: null,
     };
+  }
+
+  /**
+   * PART 4 — reference-image binding check.
+   *
+   * The selected product record is the SOURCE OF TRUTH. The reference image
+   * must (a) be a permitted http(s) URL, and (b) still resolve to the SAME
+   * catalog product that was reserved. A mismatch (e.g. a stale reservation
+   * after a re-import swapped the image, or a hand-edited record) is BLOCKED
+   * with an explicit reason — the pipeline never generates from a reference it
+   * cannot tie to the selected product, and never substitutes a lookalike.
+   */
+  private verifyReferenceBinding(
+    record: SlotContentRecord,
+  ): { ok: true } | { ok: false; code: string; message: string } {
+    const url = record.referenceImageUrl ?? '';
+    if (!/^https?:\/\//i.test(url)) {
+      return {
+        ok: false,
+        code: 'invalid_reference_image',
+        message: `The reserved reference image is not a permitted http(s) URL ("${url.slice(0, 80)}"); generation is blocked.`,
+      };
+    }
+    const product = record.productId ? this.deps.catalog.get(record.productId) : null;
+    if (!product) {
+      return {
+        ok: false,
+        code: 'reference_product_missing',
+        message:
+          'The reserved product is no longer in the catalog, so its reference image cannot be verified.',
+      };
+    }
+    if (!product.imageUrl || product.imageUrl !== record.referenceImageUrl) {
+      return {
+        ok: false,
+        code: 'reference_product_mismatch',
+        message:
+          'The reserved reference image no longer belongs to the selected catalog product; generation is blocked rather than risk an unfaithful image.',
+      };
+    }
+    return { ok: true };
   }
 
   /* ---------------------------------------------------------------------- */
@@ -291,6 +354,23 @@ export class ContentPipeline {
             message:
               'The reserved product has no reference image; generation is blocked to avoid an unfaithful result. Import a feed with product images or pick another product.',
           },
+        ],
+        completedAt: this.now().toISOString(),
+      });
+    }
+
+    // PART 4 — verify the reference image is a PERMITTED, product-owned asset
+    // and that it still BELONGS to the reserved product. A reference that is
+    // not an http(s) URL, or that does not match the catalog product's image,
+    // is quarantined (blocked) — never silently substituted with a lookalike.
+    const referenceCheck = this.verifyReferenceBinding(record);
+    if (!referenceCheck.ok) {
+      actions.push(`reference_${referenceCheck.code}`);
+      return this.persist(record, {
+        stage: 'blocked',
+        blockers: [
+          ...record.blockers,
+          { code: referenceCheck.code, message: referenceCheck.message },
         ],
         completedAt: this.now().toISOString(),
       });
@@ -473,20 +553,68 @@ export class ContentPipeline {
       });
     }
 
-    let generated;
-    try {
-      generated = await captionGenerator.generate({
-        product: toFeedProduct(catalogProduct),
-        affiliateUrl: record.affiliateUrl,
-        language: 'id',
-        tone: 'soft_sell',
-      });
-    } catch (error) {
-      actions.push('caption_failed');
-      return this.persist(current, {
-        stage: 'failed',
-        lastError: `Caption generation failed: ${redactMessage(error)}`,
-      });
+    let generated: GeneratedCaption;
+    let baseIssues;
+    const editorialBrief: CaptionEditorialBrief = {
+      mandatoryFinalHashtags: [...MANDATORY_FINAL_HASHTAGS.split(' ')],
+      claimPolicy:
+        'Never imply the account owner owns, received, tried, used, or is interested in this product. ' +
+        'No first-person ownership/receipt/usage/firsthand-result/endorsement claims. Neutral, product-focused Indonesian copy only.',
+      disclosureHint: 'Include an affiliate disclosure in the body (e.g. "link afiliasi").',
+    };
+    const verifiedFacts = {
+      price: catalogProduct.price,
+      currency: catalogProduct.currency,
+      rating: catalogProduct.rating,
+      soldCount: catalogProduct.soldCount,
+    };
+
+    // PART 4 — bounded regeneration: generate, validate (structural + editorial),
+    // and if it fails, regenerate WITH the exact failing rules as feedback. The
+    // publish gate is never bypassed to keep the schedule moving.
+    let attempt = 0;
+    let priorErrors: { rule: string; message: string }[] = [];
+    for (;;) {
+      attempt += 1;
+      try {
+        generated = await captionGenerator.generate({
+          product: toFeedProduct(catalogProduct),
+          affiliateUrl: record.affiliateUrl,
+          language: 'id',
+          tone: 'soft_sell',
+          editorialBrief,
+          regenerationAttempt: attempt,
+          previousIssues: priorErrors,
+        });
+      } catch (error) {
+        actions.push('caption_failed');
+        return this.persist(current, {
+          stage: 'failed',
+          lastError: `Caption generation failed: ${redactMessage(error)}`,
+        });
+      }
+
+      baseIssues = [
+        ...validateCaption({
+          caption: generated,
+          requiredAffiliateUrl: record.affiliateUrl,
+          platform: 'facebook_page',
+        }),
+        ...editorialToValidationIssues(
+          evaluateEditorialPolicy(generated.fullText, {
+            requiredAffiliateUrl: record.affiliateUrl,
+            platform: 'facebook_page',
+            verifiedFacts,
+          }),
+        ),
+      ];
+      priorErrors = baseIssues
+        .filter((issue) => issue.severity === 'error')
+        .map((issue) => ({ rule: issue.rule, message: issue.message }));
+      if (!blocksPublish(baseIssues) || attempt >= MAX_CAPTION_ATTEMPTS) {
+        break;
+      }
+      actions.push(`caption_attempt_${attempt}_rejected`);
     }
 
     const appSettings = settings.current();
@@ -508,14 +636,23 @@ export class ContentPipeline {
     const captions: SlotCaption[] = [];
     for (const platform of platforms) {
       // ONE canonical caption; per-platform adaptation only adjusts FORMATTING
-      // (hashtag trimming to fit Threads' 500-char limit). Product facts and
-      // the affiliate URL are never altered.
+      // (hashtag trimming to fit Threads' 500-char limit, preserving the
+      // mandatory `#ai #automation` ending). Facts and the URL never change.
       const text = adaptCaptionForPlatform(generated.fullText, platform);
-      const issues = validateCaption({
-        caption: { ...generated, fullText: text },
-        requiredAffiliateUrl: record.affiliateUrl,
-        platform,
-      });
+      const issues = [
+        ...validateCaption({
+          caption: { ...generated, fullText: text },
+          requiredAffiliateUrl: record.affiliateUrl,
+          platform,
+        }),
+        ...editorialToValidationIssues(
+          evaluateEditorialPolicy(text, {
+            requiredAffiliateUrl: record.affiliateUrl,
+            platform,
+            verifiedFacts,
+          }),
+        ),
+      ];
       captions.push({
         platform,
         fullText: text,
@@ -534,6 +671,9 @@ export class ContentPipeline {
       });
     }
 
+    if (attempt > 1) {
+      actions.push(`caption_regenerated_after_${attempt}_attempts`);
+    }
     actions.push('captions_generated');
     return this.persist({ ...current, captions }, { stage: 'captions_ready' });
   }
@@ -661,8 +801,9 @@ export function chooseImageCount(slotKey: string, policy: 'random_1_or_2' | 'one
  * Platform formatting adaptation.
  *
  * Facebook: unchanged. Threads: if the text exceeds the 500-char limit, drop
- * hashtags from the end (keeping at least one) until it fits. Product facts,
- * the CTA and the affiliate URL are never modified.
+ * OPTIONAL hashtags from the end (keeping at least one) until it fits. Product
+ * facts, the CTA and the affiliate URL are never modified, and the MANDATORY
+ * `#ai #automation` ending is always preserved (never trimmed).
  */
 export function adaptCaptionForPlatform(
   fullText: string,
@@ -677,12 +818,20 @@ export function adaptCaptionForPlatform(
   if (hashtagLine === undefined) {
     return fullText; // no hashtag line to trim; validation reports the overflow
   }
-  const tags = hashtagLine.split(/\s+/).filter(Boolean);
+  const allTags = hashtagLine.split(/\s+/).filter(Boolean);
+  // Preserve the mandatory `#ai #automation` ending (last two tags, when present).
+  const mandatory = allTags.slice(-2);
+  const hasMandatory =
+    mandatory.length === 2 &&
+    mandatory[0]?.toLowerCase() === '#ai' &&
+    mandatory[1]?.toLowerCase() === '#automation';
+  const optional = hasMandatory ? allTags.slice(0, -2) : allTags;
+  const tail = hasMandatory ? mandatory : [];
   let text = fullText;
-  while (text.length > 500 && tags.length > 1) {
-    tags.pop();
+  while (text.length > 500 && optional.length > (hasMandatory ? 0 : 1)) {
+    optional.pop();
     const copy = [...lines];
-    copy[hashtagLineIndex] = tags.join(' ');
+    copy[hashtagLineIndex] = [...optional, ...tail].join(' ');
     text = copy.join('\n');
   }
   return text;

@@ -21,9 +21,9 @@
  *    from imported fields (see eligibility.ts).
  */
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import path from 'node:path';
+import { readFile } from 'node:fs/promises';
 import type { FeedParseResult, FeedProduct, FeedRowIssue } from '../contracts/index.js';
+import { atomicWriteText, createSerialQueue } from '../core/atomic-file.js';
 import { AppError } from '../core/errors.js';
 import { evaluateEligibility, normalizeCategoryId } from './eligibility.js';
 
@@ -175,16 +175,18 @@ export class FileCatalogStore implements CatalogStore {
   }
 
   async save(snapshot: CatalogSnapshot): Promise<void> {
-    const dir = path.dirname(this.filePath);
-    const tmp = `${this.filePath}.tmp`;
-    try {
-      await mkdir(dir, { recursive: true });
-      await writeFile(tmp, `${JSON.stringify(snapshot)}\n`, 'utf8');
-      await rename(tmp, this.filePath);
-    } catch (error) {
-      throw new CatalogStoreError(`Could not write catalog file ${this.filePath}`, error);
-    }
+    // Serialized per instance: an older catalog snapshot must never overwrite
+    // a newer one (imports and pipeline selection reads/writes can overlap).
+    await this.queue(async () => {
+      try {
+        await atomicWriteText(this.filePath, `${JSON.stringify(snapshot)}\n`);
+      } catch (error) {
+        throw new CatalogStoreError(`Could not write catalog file ${this.filePath}`, error);
+      }
+    });
   }
+
+  private readonly queue = createSerialQueue();
 }
 
 /* -------------------------------------------------------------------------- */

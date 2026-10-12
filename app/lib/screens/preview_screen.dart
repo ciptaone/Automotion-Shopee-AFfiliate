@@ -104,7 +104,9 @@ class _PreviewScreenState extends State<PreviewScreen> {
           _slotCard(preview),
           _productCard(preview),
           _imagesCard(preview),
+          if (preview.imageQuality != null) _imageQualityCard(preview),
           _captionCard(preview),
+          if (preview.editorial != null) _editorialCard(preview),
           _validationCard(preview),
           _platformsCard(preview),
           const SizedBox(height: 24),
@@ -277,19 +279,54 @@ class _PreviewScreenState extends State<PreviewScreen> {
   }
 
   Widget _productCard(ContentPreview preview) {
+    final scheme = Theme.of(context).colorScheme;
+    final referenceAvailable = preview.product.referenceAvailable;
     return SectionCard(
       title: 'Product',
       icon: Icons.shopping_bag_outlined,
       children: [
         Text(preview.product.name, style: Theme.of(context).textTheme.titleSmall),
+        if (preview.product.sourceProductId != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            'Catalog id ${preview.product.sourceProductId}'
+            '${preview.product.categoryId == null ? '' : ' · ${preview.product.categoryId}'}',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: scheme.onSurfaceVariant),
+          ),
+        ],
         const SizedBox(height: 8),
         SelectableText(
           preview.product.affiliateUrl,
           style: TextStyle(
             fontSize: 13,
-            color: Theme.of(context).colorScheme.primary,
+            color: scheme.primary,
           ),
         ),
+        // PART 4: reference-image availability is always explicit — the
+        // product record is the source of truth for image generation.
+        if (referenceAvailable != null) ...[
+          const SizedBox(height: 8),
+          StatusChip(
+            label: referenceAvailable ? 'Reference image available' : 'Reference image MISSING',
+            color: referenceAvailable ? Colors.green : Colors.red,
+            icon: referenceAvailable
+                ? Icons.image_rounded
+                : Icons.broken_image_outlined,
+          ),
+          if (!referenceAvailable && preview.product.referenceUnavailableReason != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              preview.product.referenceUnavailableReason!,
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: scheme.error),
+            ),
+          ],
+        ],
         const SizedBox(height: 8),
         Align(
           alignment: Alignment.centerLeft,
@@ -355,17 +392,19 @@ class _PreviewScreenState extends State<PreviewScreen> {
   }
 
   Widget _captionCard(ContentPreview preview) {
+    final caption = preview.caption;
+    final scheme = Theme.of(context).colorScheme;
     return SectionCard(
       title: 'Caption',
       icon: Icons.chat_bubble_outline_rounded,
       children: [
-        SelectableText(preview.caption.fullText, style: const TextStyle(fontSize: 13.5)),
+        SelectableText(caption.fullText, style: const TextStyle(fontSize: 13.5)),
         const SizedBox(height: 12),
         Wrap(
           spacing: 6,
           runSpacing: 6,
           children: [
-            for (final tag in preview.caption.hashtags)
+            for (final tag in caption.hashtags)
               Chip(
                 label: Text(tag, style: const TextStyle(fontSize: 12)),
                 visualDensity: VisualDensity.compact,
@@ -373,6 +412,136 @@ class _PreviewScreenState extends State<PreviewScreen> {
               ),
           ],
         ),
+        // PART 4: the mandatory tail is a hard rule — surface it explicitly.
+        if (caption.mandatoryFinalHashtags != null) ...[
+          const SizedBox(height: 8),
+          StatusChip(
+            label: caption.hasMandatoryEnding
+                ? 'Ends with ${caption.mandatoryFinalHashtags}'
+                : 'Missing required ending ${caption.mandatoryFinalHashtags}',
+            color: caption.hasMandatoryEnding ? Colors.green : Colors.red,
+            icon: caption.hasMandatoryEnding
+                ? Icons.check_circle_rounded
+                : Icons.cancel_rounded,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'The caption must end exactly with those hashtags, with nothing '
+            'after them. The backend rejects and regenerates any caption that '
+            'does not.',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: scheme.onSurfaceVariant),
+          ),
+        ],
+      ],
+    );
+  }
+
+  /// PART 4 — structured editorial policy result (claims, disclosure, ending).
+  Widget _editorialCard(ContentPreview preview) {
+    final editorial = preview.editorial!;
+    final scheme = Theme.of(context).colorScheme;
+    return SectionCard(
+      title: 'Editorial policy',
+      icon: Icons.rule_rounded,
+      trailing: StatusChip(
+        label: editorial.passed ? 'Passed' : 'Blocked',
+        color: editorial.passed ? Colors.green : Colors.red,
+        icon: editorial.passed ? Icons.check_rounded : Icons.block_rounded,
+      ),
+      children: [
+        KeyValueRow('Engine', editorial.source),
+        KeyValueRow('Required ending', editorial.mandatoryFinalHashtags),
+        KeyValueRow(
+          'Ending present',
+          editorial.mandatoryEndingPresent ? 'Yes' : 'No',
+        ),
+        KeyValueRow(
+          'Affiliate disclosure',
+          editorial.disclosurePresent ? 'Present' : 'Missing',
+        ),
+        if (editorial.blocking.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text('Rejected claims:',
+              style: Theme.of(context)
+                  .textTheme
+                  .titleSmall
+                  ?.copyWith(fontWeight: FontWeight.w600)),
+          const SizedBox(height: 4),
+          for (final issue in editorial.blocking)
+            _IssueLine(rule: issue.rule, message: issue.message, color: scheme.error),
+        ],
+        if (editorial.warnings.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          for (final issue in editorial.warnings)
+            _IssueLine(
+              rule: issue.rule,
+              message: issue.message,
+              color: const Color(0xFF9A6B00),
+            ),
+        ],
+        if (editorial.limitations.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(
+            editorial.limitations,
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: scheme.onSurfaceVariant),
+          ),
+        ],
+      ],
+    );
+  }
+
+  /// PART 4 — structural image quality. The fidelity score is ALWAYS absent
+  /// (no vision scorer), and the screen says so instead of inventing one.
+  Widget _imageQualityCard(ContentPreview preview) {
+    final quality = preview.imageQuality!;
+    final scheme = Theme.of(context).colorScheme;
+    return SectionCard(
+      title: 'Image quality',
+      icon: Icons.high_quality_outlined,
+      trailing: StatusChip(
+        label: quality.passed ? 'Structural checks passed' : 'Structural problems found',
+        color: quality.passed ? Colors.green : Colors.red,
+        icon: quality.passed ? Icons.check_rounded : Icons.block_rounded,
+      ),
+      children: [
+        KeyValueRow('Engine', quality.source),
+        KeyValueRow(
+          'Automated fidelity score',
+          quality.automatedFidelityScore == null
+              ? 'Not available (never fabricated)'
+              : '${quality.automatedFidelityScore}',
+        ),
+        if (quality.blocking.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          for (final issue in quality.blocking)
+            _IssueLine(rule: issue.rule, message: issue.message, color: scheme.error),
+        ],
+        if (quality.notAssessed.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text(
+            'Not machine-verified: ${quality.notAssessed.map((d) => d.dimension).join(', ')}.',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: const Color(0xFF9A6B00)),
+          ),
+        ],
+        if (quality.limitations.isNotEmpty) ...[
+          const SizedBox(height: 6),
+          Text(
+            quality.limitations,
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: scheme.onSurfaceVariant),
+          ),
+        ],
       ],
     );
   }

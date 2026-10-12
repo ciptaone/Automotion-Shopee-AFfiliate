@@ -254,7 +254,18 @@ export function selectProduct(
 
   const scored = candidates
     .map((product) => scoreProduct(product, context))
-    .sort((a, b) => b.score - a.score || a.product.internalId.localeCompare(b.product.internalId));
+    // Tie-break on the STABLE product identity (marketplace + source id), never
+    // on `internalId`: that value is a per-instance UUID, so breaking ties with
+    // it made two catalog loads of the same feed choose different products for
+    // the same slot key — non-deterministic selection across restarts/imports.
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        `${a.product.marketplace}:${a.product.sourceProductId}`.localeCompare(
+          `${b.product.marketplace}:${b.product.sourceProductId}`,
+        ) ||
+        a.product.internalId.localeCompare(b.product.internalId),
+    );
 
   const band = Math.max(1, context.topBand ?? DEFAULT_TOP_BAND);
   const topScore = scored[0]?.score ?? 0;

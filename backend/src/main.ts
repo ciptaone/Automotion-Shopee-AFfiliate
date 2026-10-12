@@ -129,6 +129,65 @@ async function main(): Promise<void> {
     logger.fatal({ err: error }, 'failed to start server');
     process.exit(1);
   }
+
+  /* --- 6. Content scheduler loop (Part 4) --- */
+  // Runs INDEPENDENTLY of the APK: the backend computes due slots, enqueues
+  // them under persistent job identities and executes the content pipeline.
+  // `tick()` is self-serializing, so an overlapping tick is a no-op, and each
+  // tick is individually caught so one failure never kills the loop.
+  //
+  // Enabled only when SCHEDULER_ENABLED=true and SCHEDULER_MODE != 'disabled'.
+  // The loop itself never publishes: it stops at `publish_ready`.
+  const schedulerEnabled = env.SCHEDULER_ENABLED === 'true' && env.SCHEDULER_MODE !== 'disabled';
+  const TICK_INTERVAL_MS = 60_000; // poll; slot cadence itself is intervalMinutes
+  let schedulerTimer: NodeJS.Timeout | null = null;
+
+  if (schedulerEnabled) {
+    const runTick = async (): Promise<void> => {
+      try {
+        const result = await container.contentScheduler.tick();
+        logger.info(
+          {
+            today: result.today,
+            enqueued: result.enqueued,
+            executed: result.executed.map((e) => ({ slotKey: e.slotKey, stage: e.stage })),
+            skipped: result.skipped,
+            failed: result.failed.map((f) => ({ slotKey: f.slotKey })),
+            pendingJobs: result.pendingJobs,
+          },
+          `content scheduler tick: ${result.message}`,
+        );
+      } catch (error) {
+        // Recoverable: log and keep the loop alive for the next tick.
+        logger.error({ err: error }, 'content scheduler tick failed; continuing');
+      }
+    };
+
+    schedulerTimer = setInterval(() => void runTick(), TICK_INTERVAL_MS);
+    // First pass shortly after boot so an interrupted slot resumes promptly.
+    setTimeout(() => void runTick(), 2_000);
+    logger.info(
+      { tickIntervalMs: TICK_INTERVAL_MS, mode: env.SCHEDULER_MODE },
+      'content scheduler loop started (scheduler -> queue -> pipeline; no publishing)',
+    );
+  } else {
+    logger.info(
+      { schedulerEnabled: env.SCHEDULER_ENABLED, mode: env.SCHEDULER_MODE },
+      'content scheduler loop NOT started (SCHEDULER_ENABLED=false or SCHEDULER_MODE=disabled)',
+    );
+  }
+
+  const stopScheduler = (): void => {
+    if (schedulerTimer) {
+      clearInterval(schedulerTimer);
+      schedulerTimer = null;
+      logger.info({}, 'content scheduler loop stopped');
+    }
+  };
+
+  // Register the stop hook on the existing shutdown path.
+  process.prependListener('SIGINT', stopScheduler);
+  process.prependListener('SIGTERM', stopScheduler);
 }
 
 void main();

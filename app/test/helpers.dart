@@ -404,6 +404,14 @@ Map<String, dynamic> pipelinePreviewFixture({
   String imageProviderKind = 'mock',
   String captionProviderKind = 'mock',
   int attempts = 1,
+  bool referenceAvailable = true,
+  String? referenceUnavailableReason,
+  bool editorialPassed = true,
+  bool mandatoryEndingPresent = true,
+  bool disclosurePresent = true,
+  List<Map<String, dynamic>> editorialBlocking = const [],
+  bool includeEditorial = true,
+  bool includeImageQuality = true,
 }) =>
     {
       'source': 'pipeline',
@@ -442,6 +450,11 @@ Map<String, dynamic> pipelinePreviewFixture({
         'name': 'Serum Vitamin C (produk katalog)',
         'affiliateUrl': 'https://s.shopee.co.id/aff-1',
         'source': 'catalog',
+        'sourceProductId': '1',
+        'categoryId': 'health-beauty',
+        'referenceImageUrl': 'https://cf.shopee.co.id/img/1.jpg',
+        'referenceAvailable': referenceAvailable,
+        'referenceUnavailableReason': referenceUnavailableReason,
         'price': 120000,
         'currency': 'IDR',
         'commissionRate': 10,
@@ -453,8 +466,10 @@ Map<String, dynamic> pipelinePreviewFixture({
         'source': 'generated',
         'fullText':
             'Lagi cari serum vitamin C?\n\nKlik link di bawah untuk cek detailnya.\n\n'
-                '#shopeeaffiliate #serum\nhttps://s.shopee.co.id/aff-1',
+                '#shopeeaffiliate #serum\nhttps://s.shopee.co.id/aff-1\n#ai #automation',
         'hashtags': ['#shopeeaffiliate', '#serum'],
+        'mandatoryFinalHashtags': '#ai #automation',
+        'mandatoryEndingPresent': mandatoryEndingPresent,
         'validationPassed': true,
         'blocking': <Map<String, dynamic>>[],
         'platforms': {
@@ -462,6 +477,40 @@ Map<String, dynamic> pipelinePreviewFixture({
           'threads': {'passed': true, 'fullText': 'sama'},
         },
       },
+      if (includeEditorial)
+        'editorial': {
+          'source': 'editorial_policy',
+          'passed': editorialPassed,
+          'mandatoryFinalHashtags': '#ai #automation',
+          'mandatoryEndingPresent': mandatoryEndingPresent,
+          'disclosurePresent': disclosurePresent,
+          'blocking': editorialBlocking,
+          'warnings': <Map<String, dynamic>>[],
+          'limitations':
+              'Heuristic structured claim detection + structural rules. Not a '
+                  'substitute for human editorial review.',
+        },
+      if (includeImageQuality)
+        'imageQuality': {
+          'source': 'structural_image_quality',
+          'passed': publishReady,
+          'automatedFidelityScore': null,
+          'limitations':
+              'Structural checks only (format, size, dimensions, composition, '
+                  'duplicate bytes). Product identity, packaging fidelity and '
+                  'anatomy realism are NOT automatically verified.',
+          'notAssessed': [
+            {
+              'dimension': 'product_identity',
+              'reason': 'No vision-based fidelity scorer is configured.',
+            },
+            {
+              'dimension': 'packaging_fidelity',
+              'reason': 'No vision-based fidelity scorer is configured.',
+            },
+          ],
+          'blocking': <Map<String, dynamic>>[],
+        },
       'validation': {
         'source': 'real_validator_on_generated_content',
         'passed': publishReady,

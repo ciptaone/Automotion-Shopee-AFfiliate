@@ -15,6 +15,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   ContentPipeline,
+  MAX_CAPTION_ATTEMPTS,
   adaptCaptionForPlatform,
   chooseImageCount,
 } from '../../src/automation/pipeline.js';
@@ -34,7 +35,14 @@ import { FileSlotStore } from '../../src/automation/slot-store.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { ImageGenerator, GeneratedImage, Notifier } from '../../src/contracts/index.js';
+import type {
+  CaptionGenerationRequest,
+  CaptionGenerator,
+  GeneratedCaption,
+  GeneratedImage,
+  ImageGenerator,
+  Notifier,
+} from '../../src/contracts/index.js';
 
 /* -------------------------------------------------------------------------- */
 /*  Synthetic feed fixtures (documented, synthetic test data only)            */
@@ -108,6 +116,72 @@ class FlakyImageGenerator implements ImageGenerator {
   }
 }
 
+/**
+ * Caption generator that serves a SCRIPTED sequence of texts, one per call.
+ *
+ * PART 4 tests use it to force editorial failures (a compliant-looking caption
+ * that still makes a forbidden first-person claim) and to observe exactly what
+ * the regeneration loop sends back — the call count and the `previousIssues`
+ * feedback — which the deterministic mock generator can never express.
+ */
+class ScriptedCaptionGenerator implements CaptionGenerator {
+  readonly info = {
+    name: 'scripted_caption',
+    kind: 'mock' as const,
+    model: 'scripted-v1',
+    ready: true,
+    detail: 'Serves pre-scripted caption texts; records every request.',
+  };
+  readonly requests: CaptionGenerationRequest[] = [];
+  private index = 0;
+
+  constructor(private readonly texts: readonly string[]) {}
+
+  async generate(request: CaptionGenerationRequest): Promise<GeneratedCaption> {
+    this.requests.push(request);
+    const fullText =
+      this.texts[this.index] ??
+      'Lagi cari yang praktis?\n\nProduknya bisa dicek langsung di linknya.\n\nKlik linknya untuk lihat detailnya.\n\nLink di bawah adalah link afiliasi.\n\n#shopee #ai #automation';
+    this.index += 1;
+    return {
+      hook: fullText.split('\n')[0] ?? '',
+      body: fullText,
+      cta: 'Klik linknya untuk lihat detailnya.',
+      hashtags: ['#shopee', '#ai', '#automation'],
+      fullText,
+      embeddedUrl: request.affiliateUrl,
+      model: this.info.model,
+      estimatedCostUsd: 0,
+    };
+  }
+}
+
+/** Image generator that always returns the same structurally valid PNG. */
+class DummyImageGenerator implements ImageGenerator {
+  readonly info = {
+    name: 'dummy_image',
+    kind: 'mock' as const,
+    model: 'dummy-v1',
+    ready: true,
+    detail: 'Returns a fixed valid PNG; used when image content is irrelevant.',
+  };
+  private static readonly PNG = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+  ]);
+
+  async generate(request: Parameters<ImageGenerator['generate']>[0]): Promise<GeneratedImage> {
+    return {
+      bytes: DummyImageGenerator.PNG,
+      mimeType: 'image/png',
+      width: 1080,
+      height: 1920,
+      seed: request.seed,
+      model: this.info.model,
+      estimatedCostUsd: 0,
+    };
+  }
+}
+
 /** Notifier that records what it was asked to send. */
 class RecordingNotifier implements Notifier {
   readonly info = {
@@ -143,6 +217,7 @@ async function harness(
     rows?: string[][];
     imagePolicy?: 'random_1_or_2' | 'one' | 'two';
     imageGenerator?: ImageGenerator;
+    captionGenerator?: CaptionGenerator;
     storage?: MemoryObjectStorage;
     facebookEnabled?: boolean;
     threadsEnabled?: boolean;
@@ -167,7 +242,7 @@ async function harness(
     slots,
     settings,
     imageGenerator: options.imageGenerator ?? new MockImageGenerator(),
-    captionGenerator: new MockCaptionGenerator(),
+    captionGenerator: options.captionGenerator ?? new MockCaptionGenerator(),
     storage,
     notifier,
   });
@@ -794,5 +869,337 @@ describe('slot store persistence', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+/* ========================================================================== */
+/*  PART 4 — editorial gate: bounded regeneration, never bypassed            */
+/* ========================================================================== */
+
+/** Neutral, fully compliant Indonesian copy: no first-person anything. */
+const NEUTRAL_CAPTION = (url: string): string =>
+  [
+    'Lagi cari tumbler yang praktis buat harian?',
+    // No price is stated: the fabrication guard would reject any price that
+    // differs from the verified catalog price.
+    'Produknya: Tumbler Stainless 500ml. Kategori Health & Beauty.',
+    'Klik linknya untuk cek detail dan ketersediaannya di Shopee.',
+    'Link di bawah adalah link afiliasi.',
+    '#shopee #tumbler',
+    url,
+    '#ai #automation',
+  ].join('\n\n');
+
+/** Structurally perfect copy that STILL makes a forbidden ownership claim. */
+const FIRST_PERSON_CAPTION = (url: string): string =>
+  [
+    'Lagi cari tumbler yang praktis buat harian?',
+    'Produknya: Tumbler Stainless 500ml. Barang ini punya saya dan awet banget.',
+    'Klik linknya untuk cek detail dan ketersediaannya di Shopee.',
+    'Link di bawah adalah link afiliasi.',
+    '#shopee #tumbler',
+    url,
+    '#ai #automation',
+  ].join('\n\n');
+
+/** Structurally perfect copy that fabricates a discount. */
+const FABRICATED_DISCOUNT_CAPTION = (url: string): string =>
+  [
+    'Lagi cari tumbler yang praktis buat harian?',
+    'Produknya: Tumbler Stainless 500ml. Diskon 50% hari ini saja di Shopee.',
+    'Klik linknya untuk cek detail dan ketersediaannya di Shopee.',
+    'Link di bawah adalah link afiliasi.',
+    '#shopee #tumbler',
+    url,
+    '#ai #automation',
+  ].join('\n\n');
+
+const AFF_URL = 'https://s.shopee.co.id/aff-1';
+
+describe('PART 4 — editorial gate inside the pipeline', () => {
+  it('regenerates up to MAX_CAPTION_ATTEMPTS, then BLOCKS a non-compliant caption', async () => {
+    const generator = new ScriptedCaptionGenerator([
+      FIRST_PERSON_CAPTION(AFF_URL),
+      FIRST_PERSON_CAPTION(AFF_URL),
+      FIRST_PERSON_CAPTION(AFF_URL),
+    ]);
+    const { pipeline } = await harness({
+      rows: [row('1', 'Health & Beauty')],
+      imagePolicy: 'one',
+      imageGenerator: new DummyImageGenerator(),
+      captionGenerator: generator,
+    });
+
+    const { record } = await pipeline.runSlot('2026-10-12#30');
+
+    // The bound is honored exactly: never more, never fewer.
+    expect(generator.requests).toHaveLength(MAX_CAPTION_ATTEMPTS);
+    expect(record.stage).toBe('blocked');
+    expect(record.validationPassed).toBe(false);
+    expect(record.captions).toHaveLength(2); // both platforms kept for diagnosis
+    for (const caption of record.captions) {
+      expect(caption.validationPassed).toBe(false);
+      expect(
+        caption.blocking.some((b) => b.rule === 'editorial.no_first_person_claim'),
+      ).toBe(true);
+    }
+    expect(record.blockers.some((b) => b.code.startsWith('caption_invalid_'))).toBe(true);
+    // The image work that succeeded is preserved (retry-safe, no wasted spend).
+    expect(record.assets).toHaveLength(1);
+  });
+
+  it('regeneration is driven by the exact failing rules, and SUCCEEDS on the next attempt', async () => {
+    const generator = new ScriptedCaptionGenerator([
+      FIRST_PERSON_CAPTION(AFF_URL),
+      NEUTRAL_CAPTION(AFF_URL),
+    ]);
+    const { pipeline } = await harness({
+      rows: [row('1', 'Health & Beauty')],
+      imagePolicy: 'one',
+      imageGenerator: new DummyImageGenerator(),
+      captionGenerator: generator,
+    });
+
+    const { record } = await pipeline.runSlot('2026-10-12#31');
+
+    expect(generator.requests).toHaveLength(2);
+    // Attempt 1 carried the editorial brief; attempt 2 ALSO carried the
+    // precise failing rule so the generator corrected a KNOWN problem.
+    expect(generator.requests[0]?.editorialBrief?.mandatoryFinalHashtags).toEqual([
+      '#ai',
+      '#automation',
+    ]);
+    expect(
+      generator.requests[1]?.previousIssues?.some(
+        (issue) => issue.rule === 'editorial.no_first_person_claim',
+      ),
+    ).toBe(true);
+
+    expect(record.stage).toBe('publish_ready');
+    expect(record.validationPassed).toBe(true);
+    expect(record.blockers).toHaveLength(0);
+    for (const caption of record.captions) {
+      expect(caption.validationPassed).toBe(true);
+    }
+  });
+
+  it('a fabricated discount is rejected by the fabrication guard, not published', async () => {
+    const generator = new ScriptedCaptionGenerator([
+      FABRICATED_DISCOUNT_CAPTION(AFF_URL),
+      FABRICATED_DISCOUNT_CAPTION(AFF_URL),
+      FABRICATED_DISCOUNT_CAPTION(AFF_URL),
+    ]);
+    const { pipeline } = await harness({
+      rows: [row('1', 'Health & Beauty')],
+      imagePolicy: 'one',
+      imageGenerator: new DummyImageGenerator(),
+      captionGenerator: generator,
+    });
+
+    const { record } = await pipeline.runSlot('2026-10-12#32');
+
+    expect(generator.requests).toHaveLength(MAX_CAPTION_ATTEMPTS);
+    expect(record.stage).toBe('blocked');
+    expect(
+      record.captions.some((c) =>
+        c.blocking.some((b) => b.rule === 'editorial.no_unsupported_discount'),
+      ),
+    ).toBe(true);
+  });
+
+  it('every publish_ready caption ends EXACTLY with "#ai #automation" and embeds the URL', async () => {
+    const { pipeline } = await harness({
+      rows: [row('1', 'Health & Beauty')],
+      imagePolicy: 'two',
+    });
+    const { record } = await pipeline.runSlot('2026-10-12#33');
+
+    expect(record.stage).toBe('publish_ready');
+    expect(record.captions.length).toBeGreaterThan(0);
+    for (const caption of record.captions) {
+      const trimmed = caption.fullText.trimEnd();
+      expect(trimmed.endsWith('#ai #automation')).toBe(true);
+      // Nothing may follow the mandatory ending.
+      expect(trimmed.split(/\s+/).slice(-2).join(' ')).toBe('#ai #automation');
+      // The exact affiliate URL survives adaptation verbatim.
+      expect(caption.fullText).toContain(record.affiliateUrl ?? ' missing');
+    }
+    // The Threads adaptation never drops the mandatory ending.
+    const threads = record.captions.find((c) => c.platform === 'threads');
+    if (threads) {
+      expect(
+        adaptCaptionForPlatform(threads.fullText, 'threads')
+          .trimEnd()
+          .endsWith('#ai #automation'),
+      ).toBe(true);
+    }
+  });
+
+  it('publish_ready REQUIRES the editorial gate to pass (never bypassed for the schedule)', async () => {
+    // Neutral copy -> publish_ready. The same pipeline with first-person copy
+    // (test above) blocks. Proves the stage is decided by validation, not time.
+    const neutral = new ScriptedCaptionGenerator([NEUTRAL_CAPTION(AFF_URL)]);
+    const { pipeline } = await harness({
+      rows: [row('1', 'Health & Beauty')],
+      imagePolicy: 'one',
+      imageGenerator: new DummyImageGenerator(),
+      captionGenerator: neutral,
+    });
+    const { record } = await pipeline.runSlot('2026-10-12#34');
+    expect(record.stage).toBe('publish_ready');
+    expect(record.validationPassed).toBe(true);
+    expect(record.captions.every((c) => c.validationPassed)).toBe(true);
+  });
+});
+
+/* ========================================================================== */
+/*  PART 4 — reference-image binding (product record is the source of truth) */
+/* ========================================================================== */
+
+describe('PART 4 — reference-image binding', () => {
+  it('BLOCKS with reference_product_mismatch when the catalog product no longer owns the reserved image', async () => {
+    const { pipeline, catalog } = await harness({
+      rows: [row('1', 'Health & Beauty')],
+      imagePolicy: 'one',
+      imageGenerator: new DummyImageGenerator(),
+    });
+
+    // First run: the product owns its image, so the slot completes.
+    const first = await pipeline.runSlot('2026-10-12#40');
+    expect(first.record.stage).toBe('publish_ready');
+    expect(first.record.referenceImageUrl).toBe('https://cf.shopee.co.id/img/1.jpg');
+
+    // A re-import replaces the product's image: the reserved reference is now
+    // a picture of a DIFFERENT product. Generation must be blocked, never
+    // silently continued with a lookalike.
+    const reimported = await importer.parse({
+      filename: 'feed.csv',
+      content: csv([
+        HEADERS,
+        row('1', 'Health & Beauty', 'https://cf.shopee.co.id/img/1-REPLACED.jpg'),
+      ]),
+    });
+    await catalog.importFeed(reimported, { filename: 'feed.csv', format: 'csv' });
+
+    // Explicit regeneration re-opens the slot and re-verifies the binding.
+    const second = await pipeline.runSlot('2026-10-12#40', { regenerate: true });
+
+    expect(second.record.stage).toBe('blocked');
+    expect(
+      second.record.blockers.some((b) => b.code === 'reference_product_mismatch'),
+    ).toBe(true);
+    expect(second.record.validationPassed).toBe(false);
+    // Nothing new was generated from the mismatched reference.
+    expect(second.record.assets).toHaveLength(0);
+  });
+
+  it('BLOCKS with reference_product_missing when the reserved product left the catalog', async () => {
+    const { pipeline, slots } = await harness({
+      rows: [row('1', 'Health & Beauty')],
+      imagePolicy: 'one',
+      imageGenerator: new DummyImageGenerator(),
+    });
+
+    const first = await pipeline.runSlot('2026-10-12#41');
+    expect(first.record.stage).toBe('publish_ready');
+    expect(first.record.productId).not.toBeNull();
+
+    // The reservation now points at a product id the catalog no longer serves
+    // (removed upstream / replaced feed). Regeneration re-verifies the binding
+    // instead of trusting the stale reservation.
+    await slots.mutate('2026-10-12#41', async (current) => {
+      if (!current) return current;
+      await slots.put({ ...current, productId: 'catalog-id-that-no-longer-exists' });
+      return current;
+    });
+
+    const second = await pipeline.runSlot('2026-10-12#41', { regenerate: true });
+
+    expect(second.record.stage).toBe('blocked');
+    expect(
+      second.record.blockers.some(
+        (b) => b.code === 'reference_product_missing' || b.code === 'product_missing',
+      ),
+    ).toBe(true);
+    expect(second.record.assets).toHaveLength(0);
+  });
+
+  it('BLOCKS with invalid_reference_image when the reference is not a permitted http(s) URL', async () => {
+    const { pipeline, slots } = await harness({
+      rows: [row('1', 'Health & Beauty')],
+      imagePolicy: 'one',
+      imageGenerator: new DummyImageGenerator(),
+    });
+
+    await pipeline.runSlot('2026-10-12#42');
+    // Corrupt the stored reference (hand-edited record / bad migration).
+    await slots.mutate('2026-10-12#42', async (current) => {
+      if (!current) return current;
+      await slots.put({ ...current, referenceImageUrl: 'ftp://not-permitted/img.jpg' });
+      return current;
+    });
+
+    const { record } = await pipeline.runSlot('2026-10-12#42', { regenerate: true });
+
+    expect(record.stage).toBe('blocked');
+    expect(record.blockers.some((b) => b.code === 'invalid_reference_image')).toBe(true);
+    expect(record.assets).toHaveLength(0);
+  });
+
+  it('BLOCKS with missing_reference_image when the reserved product has no image at all', async () => {
+    const { pipeline, slots } = await harness({
+      rows: [row('1', 'Health & Beauty')],
+      imagePolicy: 'one',
+      imageGenerator: new DummyImageGenerator(),
+    });
+
+    await pipeline.runSlot('2026-10-12#43');
+    // The reference disappears after reservation (feed retracted it).
+    await slots.mutate('2026-10-12#43', async (current) => {
+      if (!current) return current;
+      await slots.put({ ...current, referenceImageUrl: null });
+      return current;
+    });
+
+    const { record } = await pipeline.runSlot('2026-10-12#43', { regenerate: true });
+
+    expect(record.stage).toBe('blocked');
+    expect(record.blockers.some((b) => b.code === 'missing_reference_image')).toBe(true);
+    expect(record.assets).toHaveLength(0);
+  });
+
+  it('the reserved product + reference survive a retry unchanged (stable identity)', async () => {
+    const { slotSeed } = await import('../../src/automation/selection.js');
+    // Fail position 1 deterministically: the first run reserves but produces
+    // no assets, so the retry must reuse the SAME product/reference/count.
+    const failingSeed = slotSeed('2026-10-12#44#1');
+    const flaky = new FlakyImageGenerator(new MockImageGenerator(), [failingSeed]);
+    const { pipeline, catalog, slots, settings } = await harness({
+      rows: [row('1', 'Health & Beauty')],
+      imagePolicy: 'two',
+      imageGenerator: flaky,
+    });
+
+    const first = await pipeline.runSlot('2026-10-12#44');
+    expect(first.record.stage).toBe('failed');
+    expect(first.record.productId).not.toBeNull();
+    expect(first.record.referenceImageUrl).not.toBeNull();
+
+    // Retry through a healthy generator over the SAME stores (the pattern the
+    // Part 3 retry tests use): identity must be stable, never re-reserved.
+    const healthy = new ContentPipeline({
+      catalog,
+      slots,
+      settings,
+      imageGenerator: new MockImageGenerator(),
+      captionGenerator: new MockCaptionGenerator(),
+      storage: new MemoryObjectStorage(),
+    });
+
+    const second = await healthy.runSlot('2026-10-12#44');
+    expect(second.record.stage).toBe('publish_ready');
+    expect(second.record.productId).toBe(first.record.productId);
+    expect(second.record.referenceImageUrl).toBe(first.record.referenceImageUrl);
+    expect(second.record.imageCount).toBe(first.record.imageCount);
   });
 });

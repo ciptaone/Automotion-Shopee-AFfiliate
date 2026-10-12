@@ -11,6 +11,14 @@
  */
 import type { SlotContentRecord, SlotAsset, SlotCaption } from './slot-store.js';
 import type { ValidationIssue } from '../core/errors.js';
+import {
+  MANDATORY_FINAL_HASHTAGS,
+} from '../contracts/index.js';
+import { EDITORIAL_LIMITATIONS } from '../pipeline/editorial-policy.js';
+import {
+  NO_VISION_SCORER_REASON,
+  QUALITY_LIMITATIONS,
+} from './image-quality.js';
 
 export interface PipelinePreviewImage {
   readonly position: number;
@@ -58,6 +66,10 @@ export interface PipelinePreview {
     readonly categoryId: string | null;
     readonly referenceImageUrl: string | null;
     readonly source: 'catalog';
+    /** PART 4: explicit product-reference availability (never silent). */
+    readonly referenceAvailable: boolean;
+    /** PART 4: why the reference is unavailable, when it is. */
+    readonly referenceUnavailableReason: string | null;
   };
   readonly caption: {
     readonly source: 'generated';
@@ -65,8 +77,34 @@ export interface PipelinePreview {
     readonly hashtags: readonly string[];
     /** Per-platform captions; the first enabled platform is canonical. */
     readonly platforms: readonly PipelinePreviewCaption[];
+    /** PART 4: the locked mandatory ending, shown explicitly in the APK. */
+    readonly mandatoryFinalHashtags: string;
+    /** PART 4: whether the canonical caption ends exactly with them. */
+    readonly mandatoryEndingPresent: boolean;
   };
   readonly images: readonly PipelinePreviewImage[];
+  /** PART 4: editorial policy validation (first-person claims, disclosure…). */
+  readonly editorial: {
+    readonly source: 'editorial_policy';
+    readonly passed: boolean;
+    readonly mandatoryFinalHashtags: string;
+    readonly mandatoryEndingPresent: boolean;
+    readonly disclosurePresent: boolean;
+    readonly blocking: ReadonlyArray<{ rule: string; message: string }>;
+    readonly warnings: ReadonlyArray<{ rule: string; message: string }>;
+    readonly limitations: string;
+  };
+  /** PART 4: image-quality status with honest limitation disclosure. */
+  readonly imageQuality: {
+    readonly source: 'structural_image_quality';
+    readonly passed: boolean;
+    /** Always null: no vision-based fidelity scorer is implemented. */
+    readonly automatedFidelityScore: null;
+    readonly limitations: string;
+    /** Dimensions that were NOT assessed and why (never fabricated). */
+    readonly notAssessed: readonly { dimension: string; reason: string }[];
+    readonly blocking: ReadonlyArray<{ rule: string; message: string }>;
+  };
   readonly validation: {
     readonly source: 'real_validator_on_generated_content';
     readonly passed: boolean;
@@ -178,6 +216,30 @@ export function buildPipelinePreview(input: BuildPipelinePreviewInput): Pipeline
     ? { name: canonicalCaption.provider, kind: canonicalCaption.providerKind }
     : null;
 
+  /* --- PART 4: reference availability (explicit, never silent) --- */
+  const referenceAvailable = Boolean(record.referenceImageUrl);
+  let referenceUnavailableReason: string | null = null;
+  if (!referenceAvailable) {
+    const blocker = record.blockers.find((b) => b.code.includes('reference'));
+    referenceUnavailableReason =
+      blocker?.message ??
+      'The reserved product has no reference image, so generation is blocked rather than risk an unfaithful image.';
+  }
+
+  /* --- PART 4: editorial + image-quality views of the same issues --- */
+  const canonicalText = canonicalCaption?.fullText ?? '';
+  const mandatoryEndingPresent = canonicalText
+    .trimEnd()
+    .endsWith(MANDATORY_FINAL_HASHTAGS);
+  const editorialBlocking = blocking.filter((issue) => issue.rule.startsWith('editorial.'));
+  const editorialWarnings = warnings.filter((issue) => issue.rule.startsWith('editorial.'));
+  const imageBlocking = blocking.filter(
+    (issue) => issue.rule.startsWith('image') || issue.rule.includes('reference'),
+  );
+
+  const disclosurePresent =
+    canonicalText.length > 0 && !editorialBlocking.some((i) => i.rule === 'editorial.affiliate_disclosure');
+
   const platformDetail = (enabled: boolean): string => {
     if (!enabled) return 'Destination disabled in settings.';
     if (record.stage === 'publish_ready') {
@@ -206,14 +268,43 @@ export function buildPipelinePreview(input: BuildPipelinePreviewInput): Pipeline
       categoryId: record.categoryId,
       referenceImageUrl: record.referenceImageUrl,
       source: 'catalog',
+      referenceAvailable,
+      referenceUnavailableReason,
     },
     caption: {
       source: 'generated',
       fullText: canonicalCaption?.fullText ?? '',
       hashtags: canonicalCaption?.hashtags ?? [],
       platforms: record.captions.map(captionToPlatform),
+      mandatoryFinalHashtags: MANDATORY_FINAL_HASHTAGS,
+      mandatoryEndingPresent,
     },
     images: record.assets.map(assetToImage),
+    editorial: {
+      source: 'editorial_policy',
+      passed: editorialBlocking.length === 0,
+      mandatoryFinalHashtags: MANDATORY_FINAL_HASHTAGS,
+      mandatoryEndingPresent,
+      disclosurePresent,
+      blocking: editorialBlocking,
+      warnings: editorialWarnings,
+      limitations: EDITORIAL_LIMITATIONS,
+    },
+    imageQuality: {
+      source: 'structural_image_quality',
+      passed: imageBlocking.length === 0 && record.assets.length === record.imageCount,
+      automatedFidelityScore: null,
+      limitations: QUALITY_LIMITATIONS,
+      notAssessed: [
+        'product_identity',
+        'packaging_fidelity',
+        'main_color',
+        'anatomy_realism',
+        'lighting',
+        'generation_artifacts',
+      ].map((dimension) => ({ dimension, reason: NO_VISION_SCORER_REASON })),
+      blocking: imageBlocking,
+    },
     validation: {
       source: 'real_validator_on_generated_content',
       passed: record.validationPassed,

@@ -17,9 +17,9 @@
  *    the `SettingsStore` interface.
  *  - Nothing here ever stores a credential. Settings are pure configuration.
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import path from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
+import { atomicWriteText, createSerialQueue } from '../core/atomic-file.js';
 import { AppError } from '../core/errors.js';
 import type { ValidationIssue } from '../core/errors.js';
 
@@ -254,16 +254,18 @@ export class FileSettingsStore implements SettingsStore {
   }
 
   async save(settings: AutomationSettings): Promise<void> {
-    const dir = path.dirname(this.filePath);
-    const tmp = `${this.filePath}.tmp`;
-    try {
-      await mkdir(dir, { recursive: true });
-      await writeFile(tmp, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
-      await rename(tmp, this.filePath);
-    } catch (error) {
-      throw new SettingsStoreError(`Could not write settings file ${this.filePath}`, error);
-    }
+    // Serialized per instance: an older snapshot must never overwrite a newer
+    // one (settings are written by API control calls and by the scheduler).
+    await this.queue(async () => {
+      try {
+        await atomicWriteText(this.filePath, `${JSON.stringify(settings, null, 2)}\n`);
+      } catch (error) {
+        throw new SettingsStoreError(`Could not write settings file ${this.filePath}`, error);
+      }
+    });
   }
+
+  private readonly queue = createSerialQueue();
 }
 
 /* -------------------------------------------------------------------------- */

@@ -1,10 +1,10 @@
 /**
  * Migrations + document stores against a REAL PostgreSQL (PART 5).
  *
- * The migration chain (0000 -> 0001 -> 0002) is applied by the suite's global
- * setup with `drizzle-kit migrate`; this file asserts the resulting database is
- * actually the one the code expects, and that the single-document stores
- * (settings, scheduler checkpoints, catalog) honour their constraints.
+ * The migration chain (0000 -> 0001 -> 0002 -> 0003) is applied by the suite's
+ * global setup with `drizzle-kit migrate`; this file asserts the resulting
+ * database is actually the one the code expects, and that the single-document
+ * stores (settings, scheduler checkpoints, catalog) honour their constraints.
  */
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -38,8 +38,8 @@ describe('migrations — the committed chain applies to a fresh database', () =>
   it('reports every journal entry as applied, with no drift', async () => {
     const status = await loadMigrationStatus(MIGRATIONS_FOLDER, query);
     expect(status.tablePresent).toBe(true);
-    expect(status.journalEntries).toBe(3);
-    expect(status.appliedRows).toBe(3);
+    expect(status.journalEntries).toBe(4);
+    expect(status.appliedRows).toBe(4);
     expect(status.pendingCount).toBe(0);
     expect(status.divergedCount).toBe(0);
     expect(status.unknownApplied).toHaveLength(0);
@@ -48,6 +48,7 @@ describe('migrations — the committed chain applies to a fresh database', () =>
       '0000_init',
       '0001_part3_catalog',
       '0002_part5_persistence',
+      '0003_part6_providers',
     ]);
   });
 
@@ -59,10 +60,13 @@ describe('migrations — the committed chain applies to a fresh database', () =>
     expect(rows.map((row) => row.table_name)).toEqual([
       'api_clients',
       'app_settings',
+      'generation_usage',
       'import_batches',
       'jobs',
       'notifications',
       'products',
+      'provider_secrets',
+      'provider_workspaces',
       'publish_runs',
       'scheduler_checkpoints',
       'slot_contents',

@@ -24,6 +24,8 @@ pnpm-debug.log*
 *.pem
 *.key
 secrets/
+# Source code for the secret STORE (AES-GCM); it contains no credentials.
+!backend/src/secrets/
 credentials.json
 service-account*.json
 

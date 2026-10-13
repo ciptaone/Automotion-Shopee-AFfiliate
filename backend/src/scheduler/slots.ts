@@ -19,15 +19,66 @@
 
 export interface SchedulerConfig {
   readonly timezone: string;
+  /** Legacy Part 1 cadence (still reported for compatibility). */
   readonly intervalMinutes: number;
+  /** Legacy Part 1 cap (still reported for compatibility). */
   readonly maxSlotsPerDay: number;
+  /**
+   * PART 6 §7 — how many posts per Asia/Jakarta day: 3 or 4 (default 4).
+   * When omitted, `DEFAULT_DAILY_POST_TARGET` applies.
+   */
+  readonly dailyPostTarget?: number;
 }
 
 export const DEFAULT_SCHEDULER_CONFIG: SchedulerConfig = {
   timezone: 'Asia/Jakarta',
   intervalMinutes: 60,
   maxSlotsPerDay: 24,
+  dailyPostTarget: 4,
 };
+
+/* -------------------------------------------------------------------------- */
+/*  PART 6 §7 — fixed WIB posting windows                                     */
+/* -------------------------------------------------------------------------- */
+
+export interface PostingWindow {
+  /** Human label shown in the dashboard. */
+  readonly label: string;
+  readonly startHour: number;
+  readonly startMinute: number;
+  readonly endHour: number;
+  readonly endMinute: number;
+}
+
+/** The ONLY four windows a post may be scheduled in (Asia/Jakarta, WIB). */
+export const POSTING_WINDOWS: readonly PostingWindow[] = [
+  { label: '06:00-07:00 WIB', startHour: 6, startMinute: 0, endHour: 7, endMinute: 0 },
+  { label: '12:00-13:00 WIB', startHour: 12, startMinute: 0, endHour: 13, endMinute: 0 },
+  { label: '16:00-17:00 WIB', startHour: 16, startMinute: 0, endHour: 17, endMinute: 0 },
+  { label: '19:00-20:00 WIB', startHour: 19, startMinute: 0, endHour: 20, endMinute: 0 },
+];
+
+export const MIN_DAILY_POST_TARGET = 3;
+export const MAX_DAILY_POST_TARGET = 4;
+export const DEFAULT_DAILY_POST_TARGET = 4;
+
+/** Clamp any configured value into the legal 3..4 range. */
+export function clampDailyPostTarget(value: number | undefined | null): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_DAILY_POST_TARGET;
+  const rounded = Math.round(value);
+  if (rounded < MIN_DAILY_POST_TARGET) return MIN_DAILY_POST_TARGET;
+  if (rounded > MAX_DAILY_POST_TARGET) return MAX_DAILY_POST_TARGET;
+  return rounded;
+}
+
+/**
+ * Deterministic window selection: the first N windows in chronological order.
+ * Target 3 => 06:00, 12:00, 16:00 · Target 4 => all four windows. The same day
+ * therefore always yields the same schedule (restart-safe, no randomness).
+ */
+export function selectPostingWindows(target: number): readonly PostingWindow[] {
+  return POSTING_WINDOWS.slice(0, clampDailyPostTarget(target));
+}
 
 export interface Slot {
   /** Stable identity, e.g. "2026-10-12#03". Used as the job uniqueness key. */
@@ -80,8 +131,11 @@ export function hourInTimeZone(instant: Date, timeZone: string): number {
 /**
  * Compute the publish slots for a given calendar day in `config.timezone`.
  *
- * Slots start at 00:00 local and repeat every `intervalMinutes`. The count is
- * capped at `maxSlotsPerDay`, so a 60-minute interval yields at most 24 slots.
+ * PART 6 §7 (replaces the old 24×60-minute grid): a day has exactly
+ * `dailyPostTarget` slots (3 or 4), one per SELECTED posting window, starting
+ * at 06:00, 12:00, 16:00 and 19:00 WIB. Nothing is ever scheduled outside the
+ * four allowed windows, and the selection is deterministic (first N windows in
+ * chronological order), so a restart produces the identical schedule.
  *
  * @param dateKey Calendar day in `YYYY-MM-DD` form, interpreted in the config time zone.
  */
@@ -89,20 +143,10 @@ export function computeDailySlots(dateKey: string, config: SchedulerConfig): Slo
   if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) {
     throw new Error(`Invalid date key "${dateKey}"; expected YYYY-MM-DD`);
   }
-  if (config.intervalMinutes <= 0) {
-    throw new Error('intervalMinutes must be positive');
-  }
 
-  const slotsPerDay = Math.min(
-    config.maxSlotsPerDay,
-    Math.floor((24 * 60) / config.intervalMinutes),
-  );
-
+  const windows = selectPostingWindows(config.dailyPostTarget ?? DEFAULT_DAILY_POST_TARGET);
   const slots: Slot[] = [];
-  for (let i = 0; i < slotsPerDay; i += 1) {
-    const totalMinutes = i * config.intervalMinutes;
-    const hour = Math.floor(totalMinutes / 60);
-    const minute = totalMinutes % 60;
+  windows.forEach((window, i) => {
     slots.push({
       key: `${dateKey}#${String(i + 1).padStart(2, '0')}`,
       date: dateKey,
@@ -110,10 +154,12 @@ export function computeDailySlots(dateKey: string, config: SchedulerConfig): Slo
       // A pure wall-clock stamp with the zone's current numeric offset would
       // require tzdata; we emit local time + the zone id so consumers can
       // resolve the exact instant unambiguously.
-      scheduledFor: `${dateKey}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00${config.timezone}`,
+      scheduledFor:
+        `${dateKey}T${String(window.startHour).padStart(2, '0')}:` +
+        `${String(window.startMinute).padStart(2, '0')}:00${config.timezone}`,
       timezone: config.timezone,
     });
-  }
+  });
   return slots;
 }
 
@@ -212,6 +258,16 @@ export interface SchedulerStatus {
   readonly timezone: string;
   readonly intervalMinutes: number;
   readonly maxSlotsPerDay: number;
+  /** PART 6 §7 — configured posts per day (3 or 4). */
+  readonly dailyPostTarget: number;
+  /** PART 6 §7 — the four allowed WIB windows (always reported). */
+  readonly postingWindows: readonly string[];
+  /** PART 6 §7 — windows actually selected for `today`, with their slot keys. */
+  readonly todayWindows: readonly {
+    readonly label: string;
+    readonly key: string;
+    readonly scheduledFor: string;
+  }[];
   readonly today: string;
   readonly slotsToday: number;
   readonly nextSlot: { readonly key: string; readonly scheduledFor: string } | null;
@@ -227,17 +283,30 @@ export function describeSchedulerStatus(
   const today = todayKey(config, now);
   const slots = computeDailySlots(today, config);
   const upcoming = nextSlot(config, now);
+  const target = clampDailyPostTarget(config.dailyPostTarget ?? DEFAULT_DAILY_POST_TARGET);
+  const selected = selectPostingWindows(target);
+  const todayWindows = selected.map((window, index) => ({
+    label: window.label,
+    key: slots[index]?.key ?? `${today}#${String(index + 1).padStart(2, '0')}`,
+    scheduledFor: slots[index]?.scheduledFor ?? '',
+  }));
+  const windowTimes = selected
+    .map((window) => `${String(window.startHour).padStart(2, '0')}:${String(window.startMinute).padStart(2, '0')}`)
+    .join(', ');
   return {
     enabled,
     mode,
     timezone: config.timezone,
     intervalMinutes: config.intervalMinutes,
     maxSlotsPerDay: config.maxSlotsPerDay,
+    dailyPostTarget: target,
+    postingWindows: POSTING_WINDOWS.map((window) => window.label),
+    todayWindows,
     today,
     slotsToday: slots.length,
     nextSlot: upcoming ? { key: upcoming.key, scheduledFor: upcoming.scheduledFor } : null,
     message: enabled
-      ? `Scheduler ${mode}: ${slots.length} slot(s) today, ${config.intervalMinutes}m apart (${config.timezone}).`
+      ? `Scheduler ${mode}: ${slots.length} slot(s) today at ${windowTimes} (${config.timezone}).`
       : 'Scheduler is disabled. No jobs will be dispatched.',
   };
 }

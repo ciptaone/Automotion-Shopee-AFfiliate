@@ -17,6 +17,7 @@ import {
   DEFAULT_AUTOMATION_SETTINGS,
   FileSettingsStore,
   InMemorySettingsStore,
+  SETTINGS_CONSTRAINTS,
   SettingsService,
   SettingsStoreError,
   SettingsValidationError,
@@ -329,5 +330,102 @@ describe('SettingsService', () => {
     await service.init();
     await service.init();
     expect(service.current().intervalMinutes).toBe(45);
+  });
+});
+
+/* ========================================================================== */
+/*  PART 6 §7/§10 — daily posting target and budgets                         */
+/* ========================================================================== */
+
+describe('PART 6 — daily posting target', () => {
+  it('defaults to 4 posts per day', () => {
+    expect(DEFAULT_AUTOMATION_SETTINGS.dailyPostTarget).toBe(4);
+    expect(SETTINGS_CONSTRAINTS.defaultDailyPostTarget).toBe(4);
+    expect(SETTINGS_CONSTRAINTS.minDailyPostTarget).toBe(3);
+    expect(SETTINGS_CONSTRAINTS.maxDailyPostTarget).toBe(4);
+  });
+
+  it('accepts 3 and 4', async () => {
+    const service = new SettingsService(DEFAULT_AUTOMATION_SETTINGS, new InMemorySettingsStore());
+    await expect(service.update({ dailyPostTarget: 3 })).resolves.toMatchObject({
+      dailyPostTarget: 3,
+    });
+    await expect(service.update({ dailyPostTarget: 4 })).resolves.toMatchObject({
+      dailyPostTarget: 4,
+    });
+  });
+
+  it('rejects values outside 3..4', async () => {
+    const service = new SettingsService(DEFAULT_AUTOMATION_SETTINGS, new InMemorySettingsStore());
+    for (const value of [0, 1, 2, 5, 24, -1]) {
+      await expect(service.update({ dailyPostTarget: value })).rejects.toBeInstanceOf(
+        SettingsValidationError,
+      );
+    }
+    expect(service.current().dailyPostTarget).toBe(4);
+  });
+
+  it('rejects a non-integer target', async () => {
+    const service = new SettingsService(DEFAULT_AUTOMATION_SETTINGS, new InMemorySettingsStore());
+    await expect(service.update({ dailyPostTarget: 3.5 })).rejects.toBeInstanceOf(
+      SettingsValidationError,
+    );
+  });
+
+  it('exposes the four WIB windows to the dashboard', () => {
+    expect(SETTINGS_CONSTRAINTS.postingWindows).toEqual([
+      '06:00-07:00 WIB',
+      '12:00-13:00 WIB',
+      '16:00-17:00 WIB',
+      '19:00-20:00 WIB',
+    ]);
+  });
+
+  it('persists the target across a restart', async () => {
+    const store = new InMemorySettingsStore();
+    const first = new SettingsService(DEFAULT_AUTOMATION_SETTINGS, store);
+    await first.update({ dailyPostTarget: 3 });
+
+    const second = new SettingsService(DEFAULT_AUTOMATION_SETTINGS, store);
+    await second.init();
+    expect(second.current().dailyPostTarget).toBe(3);
+  });
+});
+
+describe('PART 6 §10 — generation budgets', () => {
+  it('defaults to no configured budget (unlimited)', () => {
+    expect(DEFAULT_AUTOMATION_SETTINGS.dailyBudgetUsd).toBeNull();
+    expect(DEFAULT_AUTOMATION_SETTINGS.monthlyBudgetUsd).toBeNull();
+  });
+
+  it('accepts a positive budget and persists it', async () => {
+    const store = new InMemorySettingsStore();
+    const service = new SettingsService(DEFAULT_AUTOMATION_SETTINGS, store);
+    await expect(
+      service.update({ dailyBudgetUsd: 1.5, monthlyBudgetUsd: 25 }),
+    ).resolves.toMatchObject({ dailyBudgetUsd: 1.5, monthlyBudgetUsd: 25 });
+
+    const restarted = new SettingsService(DEFAULT_AUTOMATION_SETTINGS, store);
+    await restarted.init();
+    expect(restarted.current().dailyBudgetUsd).toBe(1.5);
+    expect(restarted.current().monthlyBudgetUsd).toBe(25);
+  });
+
+  it('rejects a negative budget', async () => {
+    const service = new SettingsService(DEFAULT_AUTOMATION_SETTINGS, new InMemorySettingsStore());
+    await expect(service.update({ dailyBudgetUsd: -0.01 })).rejects.toBeInstanceOf(
+      SettingsValidationError,
+    );
+    await expect(service.update({ monthlyBudgetUsd: -1 })).rejects.toBeInstanceOf(
+      SettingsValidationError,
+    );
+  });
+
+  it('accepts null to clear a budget', async () => {
+    const service = new SettingsService(DEFAULT_AUTOMATION_SETTINGS, new InMemorySettingsStore());
+    await service.update({ dailyBudgetUsd: 10 });
+    await expect(service.update({ dailyBudgetUsd: null })).resolves.toMatchObject({
+      dailyBudgetUsd: null,
+    });
   });
 });

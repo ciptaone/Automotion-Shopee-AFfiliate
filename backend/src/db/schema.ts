@@ -323,3 +323,83 @@ export const schedulerCheckpoints = pgTable('scheduler_checkpoints', {
   doc: jsonb('doc').notNull().default(sql`'{}'::jsonb`),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+/* -------------------------------------------------------------------------- */
+/*  PART 6 — provider workspace (configuration only, never secrets)           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The provider CONFIGURATION document: provider definitions, the independent
+ * text/image selections and capability readiness probes. Exactly one row
+ * (CHECK id = 1), written with optimistic versioning like `app_settings`.
+ *
+ * Credentials are deliberately stored elsewhere (`provider_secrets`, encrypted).
+ */
+export const providerWorkspaces = pgTable(
+  'provider_workspaces',
+  {
+    id: smallint('id').primaryKey(),
+    /** JSON-encoded `ProviderWorkspace` (re-validated on load). */
+    doc: jsonb('doc').notNull(),
+    version: integer('version').notNull().default(1),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (_t) => [check('provider_workspaces_single_row', sql`id = 1`)],
+);
+
+/* -------------------------------------------------------------------------- */
+/*  PART 6 — encrypted provider secrets                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * AES-256-GCM ciphertext for provider credentials. The table stores NO
+ * plaintext, NO key and NO masked preview — only `iv`/`tag`/`ct` produced by
+ * `src/secrets/secret-store.ts`. Losing `SECRETS_ENCRYPTION_KEY` makes these
+ * rows permanently unreadable (documented recovery limitation).
+ */
+export const providerSecrets = pgTable('provider_secrets', {
+  /** Matches `ProviderConfig.id` — one credential per provider. */
+  providerId: varchar('provider_id', { length: 64 }).primaryKey(),
+  alg: varchar('alg', { length: 16 }).notNull().default('A256GCM'),
+  iv: text('iv').notNull(),
+  tag: text('tag').notNull(),
+  ct: text('ct').notNull(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+/* -------------------------------------------------------------------------- */
+/*  PART 6 — generation usage ledger (§10)                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One row per generation request (pipeline runs and dashboard test actions).
+ * `cost_kind` distinguishes `actual` / `estimated` / `unknown`, so a provider
+ * that reports no price is never recorded as a $0.00 charge.
+ */
+export const generationUsage = pgTable(
+  'generation_usage',
+  {
+    id: uuid('id').primaryKey(),
+    at: timestamp('at', { withTimezone: true }).notNull().defaultNow(),
+    providerId: varchar('provider_id', { length: 64 }),
+    providerName: varchar('provider_name', { length: 120 }).notNull(),
+    adapterType: varchar('adapter_type', { length: 40 }),
+    model: varchar('model', { length: 200 }).notNull(),
+    operation: varchar('operation', { length: 32 }).notNull(),
+    /** Provider-reported request id — NULL when the provider reported none. */
+    requestId: varchar('request_id', { length: 200 }),
+    status: varchar('status', { length: 16 }).notNull(),
+    latencyMs: integer('latency_ms').notNull().default(0),
+    inputTokens: integer('input_tokens'),
+    outputTokens: integer('output_tokens'),
+    images: integer('images'),
+    costUsd: doublePrecision('cost_usd'),
+    costKind: varchar('cost_kind', { length: 16 }).notNull().default('unknown'),
+    errorCode: varchar('error_code', { length: 64 }),
+  },
+  (t) => [
+    index('generation_usage_at_idx').on(t.at),
+    check('generation_usage_status_check', sql`status in ('success', 'error')`),
+    check('generation_usage_cost_kind_check', sql`cost_kind in ('actual', 'estimated', 'unknown')`),
+  ],
+);

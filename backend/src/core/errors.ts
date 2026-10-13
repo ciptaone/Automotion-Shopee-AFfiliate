@@ -390,6 +390,114 @@ export class StaleClaimError extends AppError {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  PART 6 — providers, secrets, budgets, daily posting target                */
+/* -------------------------------------------------------------------------- */
+
+/** A user-supplied endpoint failed the SSRF/shape policy. Safe to show. */
+export class EndpointRejectedError extends AppError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super({
+      code: 'ENDPOINT_REJECTED',
+      category: 'validation',
+      message,
+      expose: true,
+      retryable: false,
+      context: { reason: context?.['reason'] },
+    });
+  }
+}
+
+/** Provider configuration failed validation (never includes a secret). */
+export class ProviderConfigError extends AppError {
+  constructor(message: string, context?: Record<string, unknown>) {
+    super({
+      code: 'PROVIDER_CONFIG_INVALID',
+      category: 'validation',
+      message,
+      expose: true,
+      retryable: false,
+      context,
+    });
+  }
+}
+
+export class ProviderNotFoundError extends AppError {
+  constructor(providerId: string) {
+    super({
+      code: 'PROVIDER_NOT_FOUND',
+      category: 'not_found',
+      message: `Provider "${providerId}" does not exist.`,
+      expose: true,
+      retryable: false,
+      context: { providerId },
+    });
+  }
+}
+
+/**
+ * The selected provider cannot perform the requested capability. This is
+ * NEVER worked around by switching to another provider or a mock — the caller
+ * must surface it.
+ */
+export class CapabilityUnsupportedError extends AppError {
+  constructor(providerName: string, capability: string) {
+    super({
+      code: 'CAPABILITY_UNSUPPORTED',
+      category: 'configuration',
+      message: `Provider "${providerName}" does not support ${capability}; select a provider with that capability.`,
+      expose: true,
+      retryable: false,
+      context: { providerName, capability },
+    });
+  }
+}
+
+/** A required credential is missing or cannot be decrypted (fail closed). */
+export class ProviderSecretError extends AppError {
+  constructor(providerName: string, reason: string) {
+    super({
+      code: 'PROVIDER_SECRET_UNAVAILABLE',
+      category: 'configuration',
+      message: `Provider "${providerName}" has no usable credential: ${reason}`,
+      expose: true,
+      retryable: false,
+      context: { providerName, reason },
+    });
+  }
+}
+
+/** The configured daily/monthly generation budget is exhausted. */
+export class BudgetExhaustedError extends AppError {
+  constructor(scope: 'daily' | 'monthly', budgetUsd: number, spentUsd: number) {
+    super({
+      code: 'BUDGET_EXHAUSTED',
+      category: 'configuration',
+      message: `Generation blocked: the ${scope} budget of $${budgetUsd.toFixed(4)} is exhausted (recorded spend $${spentUsd.toFixed(4)}).`,
+      expose: true,
+      retryable: false,
+      context: { scope, budgetUsd, spentUsd },
+    });
+  }
+}
+
+/**
+ * The Asia/Jakarta daily posting target is already fully scheduled for this
+ * day. Raised by the queue's transactional daily cap (Part 6 §7).
+ */
+export class DailyPostLimitError extends AppError {
+  constructor(day: string, target: number) {
+    super({
+      code: 'DAILY_POST_LIMIT',
+      category: 'conflict',
+      message: `Daily posting target of ${target} post(s) for ${day} is already fully scheduled.`,
+      expose: true,
+      retryable: false,
+      context: { day, target },
+    });
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Narrowing helpers                                                         */
 /* -------------------------------------------------------------------------- */
 

@@ -30,7 +30,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { sql, type SQL } from 'drizzle-orm';
-import { StaleClaimError } from '../core/errors.js';
+import { DailyPostLimitError, StaleClaimError } from '../core/errors.js';
 import type {
   EnqueueJobInput,
   JobClaimOptions,
@@ -45,6 +45,14 @@ const BASE_BACKOFF_MS = 30_000;
 const MAX_BACKOFF_MS = 15 * 60_000;
 
 type Row = Record<string, unknown>;
+
+/**
+ * Anything that can run SQL: the pooled database, or a transaction. Used by the
+ * PART 6 capped enqueue so the count and the insert share one transaction.
+ */
+interface SqlExecutor {
+  execute(query: SQL): unknown;
+}
 
 /** Row -> `JobRecord`, tolerating driver differences in timestamp types. */
 function toRecord(row: Row): JobRecord {
@@ -84,7 +92,7 @@ function iso(value: unknown): string {
   return new Date(0).toISOString();
 }
 
-async function rowsOf(db: Database, query: SQL): Promise<Row[]> {
+async function rowsOf(db: SqlExecutor, query: SQL): Promise<Row[]> {
   const result = (await db.execute(query)) as unknown;
   if (Array.isArray(result)) return result as Row[];
   // Some drivers wrap the row list; unwrap defensively.
@@ -92,9 +100,60 @@ async function rowsOf(db: Database, query: SQL): Promise<Row[]> {
   return Array.isArray(maybeRows) ? (maybeRows as Row[]) : [];
 }
 
-async function firstOf(db: Database, query: SQL): Promise<Row | null> {
+async function firstOf(db: SqlExecutor, query: SQL): Promise<Row | null> {
   const rows = await rowsOf(db, query);
   return rows[0] ?? null;
+}
+
+/**
+ * The insert/reset half of `enqueue`, reusable inside a transaction (the
+ * capped path) and on the pooled connection (the uncapped path).
+ */
+async function enqueueRow(exec: SqlExecutor, input: EnqueueJobInput): Promise<Row | null> {
+  const id = randomUUID();
+  return firstOf(
+    exec,
+    sql`
+      insert into jobs (id, kind, status, unique_key, scheduled_for, attempts, max_attempts,
+                        payload, created_at, updated_at)
+      values (${id}, ${input.kind}, 'pending', ${input.uniqueKey}, ${input.scheduledFor}::timestamptz,
+              0, ${input.maxAttempts ?? 3}, ${JSON.stringify(input.payload ?? {})}, now(), now())
+      on conflict (unique_key) do update set
+        kind = excluded.kind,
+        status = 'pending',
+        scheduled_for = excluded.scheduled_for,
+        attempts = 0,
+        max_attempts = excluded.max_attempts,
+        payload = excluded.payload,
+        last_error = null,
+        claimed_by = null,
+        claimed_at = null,
+        lease_expires_at = null,
+        claim_token = null,
+        completed_at = null,
+        result = '{}',
+        updated_at = now()
+      where jobs.status in ('failed', 'cancelled')
+      returning *`,
+  );
+}
+
+async function fetchByUniqueKey(exec: SqlExecutor, uniqueKey: string): Promise<Row | null> {
+  return firstOf(exec, sql`select * from jobs where unique_key = ${uniqueKey} limit 1`);
+}
+
+/**
+ * Stable advisory-lock key for a day prefix (FNV-1a, signed 32-bit). Two
+ * processes planning the same day therefore serialize on the same lock, which
+ * is what makes the daily cap transactional instead of best-effort.
+ */
+export function dayLockKey(dayPrefix: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < dayPrefix.length; i += 1) {
+    hash ^= dayPrefix.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash | 0;
 }
 
 export interface PostgresJobQueueOptions {
@@ -117,46 +176,62 @@ export class PostgresJobQueue implements JobQueue {
    *
    * A live or already-succeeded job returns as-is (no duplicate). A failed or
    * cancelled job is RESET IN PLACE — one row per logical slot, forever.
+   *
+   * PART 6 §7: when the caller supplies `dailyCap`, the count and the insert
+   * run inside ONE transaction guarded by a per-day advisory lock, so two
+   * workers (or two processes) can never exceed the configured daily target.
    */
   async enqueue(input: EnqueueJobInput): Promise<JobRecord> {
-    const id = randomUUID();
-    const inserted = await firstOf(
-      this.db,
-      sql`
-        insert into jobs (id, kind, status, unique_key, scheduled_for, attempts, max_attempts,
-                          payload, created_at, updated_at)
-        values (${id}, ${input.kind}, 'pending', ${input.uniqueKey}, ${input.scheduledFor}::timestamptz,
-                0, ${input.maxAttempts ?? 3}, ${JSON.stringify(input.payload ?? {})}, now(), now())
-        on conflict (unique_key) do update set
-          kind = excluded.kind,
-          status = 'pending',
-          scheduled_for = excluded.scheduled_for,
-          attempts = 0,
-          max_attempts = excluded.max_attempts,
-          payload = excluded.payload,
-          last_error = null,
-          claimed_by = null,
-          claimed_at = null,
-          lease_expires_at = null,
-          claim_token = null,
-          completed_at = null,
-          result = '{}',
-          updated_at = now()
-        where jobs.status in ('failed', 'cancelled')
-        returning *`,
-    );
-    if (inserted) return toRecord(inserted);
-
-    const existing = await firstOf(
-      this.db,
-      sql`select * from jobs where unique_key = ${input.uniqueKey} limit 1`,
-    );
-    if (!existing) {
-      // Extremely unlikely (the row vanished between the two statements), but
-      // never invent success: surface it as a normal not-found.
-      throw new Error(`Job ${input.uniqueKey} not found after enqueue`);
+    if (!input.dailyCap) {
+      const inserted = await enqueueRow(this.db, input);
+      if (inserted) return toRecord(inserted);
+      const existing = await fetchByUniqueKey(this.db, input.uniqueKey);
+      if (!existing) {
+        // Extremely unlikely (the row vanished between the two statements), but
+        // never invent success: surface it as a normal not-found.
+        throw new Error(`Job ${input.uniqueKey} not found after enqueue`);
+      }
+      return toRecord(existing);
     }
-    return toRecord(existing);
+
+    const cap = input.dailyCap;
+    const day = cap.dayPrefix.replace(/#$/, '');
+
+    return this.db.transaction(async (tx) => {
+      const executor = tx as unknown as SqlExecutor;
+      // Serialize every planner working on this day (same key => same lock).
+      await executor.execute(sql`select pg_advisory_xact_lock(${dayLockKey(cap.dayPrefix)}::int)`);
+
+      // Idempotent path first: an existing key is NEVER refused by the cap.
+      const existing = await fetchByUniqueKey(executor, input.uniqueKey);
+      const resettable =
+        existing !== null && (existing.status === 'failed' || existing.status === 'cancelled');
+      if (existing && !resettable) {
+        return toRecord(existing);
+      }
+
+      // Count NEW logical jobs for the day (a reset reuses its own row, so it
+      // must not consume another unit of the target).
+      const countRow = await firstOf(
+        executor,
+        sql`
+          select count(*)::int as count
+          from jobs
+          where unique_key like ${`${cap.dayPrefix}%`}
+            and unique_key <> ${input.uniqueKey}`,
+      );
+      const used = countRow ? Number(countRow.count) : 0;
+      if (used >= cap.max) {
+        throw new DailyPostLimitError(day, cap.max);
+      }
+
+      const inserted = await enqueueRow(executor, input);
+      if (inserted) return toRecord(inserted);
+
+      const raced = await fetchByUniqueKey(executor, input.uniqueKey);
+      if (!raced) throw new Error(`Job ${input.uniqueKey} not found after capped enqueue`);
+      return toRecord(raced);
+    });
   }
 
   /**

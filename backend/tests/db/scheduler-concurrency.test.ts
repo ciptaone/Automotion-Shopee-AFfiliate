@@ -8,7 +8,8 @@
  *   - concurrent ticks must not create duplicate jobs;
  *   - the advisory tick lock turns the loser's tick into a no-op;
  *   - anti-catch-up still limits a tick to one slot after downtime;
- *   - no sequence of concurrent ticks can exceed the 24-slot/day cap;
+ *   - no sequence of concurrent ticks can exceed the daily posting target
+ *     (PART 6 §7: 3–4 WIB windows per day);
  *   - the Jakarta day boundary is used (UTC date is not);
  *   - each tick writes a durable checkpoint.
  *
@@ -40,14 +41,16 @@ function endOfPreviousJakartaDay(): { now: Date; date: string } {
 }
 
 /**
- * 18:00Z on day D is 01:00 on D+1 in Asia/Jakarta: the UTC calendar day and
+ * 23:30Z on day D is 06:30 on D+1 in Asia/Jakarta: the UTC calendar day and
  * the Jakarta calendar day DISAGREE, which is exactly what the timezone test
- * is for. Again anchored in the past so the slot is claimable.
+ * is for. It also lands INSIDE the first posting window (06:00-07:00 WIB), so
+ * the 06:00 WIB slot of the Jakarta day is due. Anchored in the past so the
+ * slot is claimable.
  */
 function earlyMorningInJakarta(): { now: Date; utcDate: string; jakartaDate: string } {
   const reference = new Date(Date.now() - 86_400_000 + 7 * 3_600_000);
   const utcDate = reference.toISOString().slice(0, 10);
-  const now = new Date(`${utcDate}T18:00:00.000Z`);
+  const now = new Date(`${utcDate}T23:30:00.000Z`);
   const jakartaDate = new Date(now.getTime() + 7 * 3_600_000).toISOString().slice(0, 10);
   return { now, utcDate, jakartaDate };
 }
@@ -94,7 +97,7 @@ describe('concurrent ticks in two processes', () => {
 
       const jobs = await jobRows(boot);
       expect(jobs.length).toBeGreaterThanOrEqual(1);
-      expect(jobs.length).toBeLessThanOrEqual(24);
+      expect(jobs.length).toBeLessThanOrEqual(4); // PART 6 §7: 3–4 windows/day
 
       const keys = jobs.map((job) => String(job.unique_key));
       expect(new Set(keys).size).toBe(keys.length);
@@ -171,7 +174,8 @@ describe('anti-catch-up and the daily cap', () => {
         expect(result.executed).toHaveLength(1);
         expect(result.enqueued).toHaveLength(1);
         const catchUpSkips = result.skipped.filter((entry) => entry.reason === 'catch_up_limited');
-        expect(catchUpSkips.length).toBeGreaterThan(1);
+        // Four windows per day; one may run, the other three are skipped.
+        expect(catchUpSkips).toHaveLength(3);
 
         expect(await jobRows(boot, date)).toHaveLength(1);
         const slotRows = (await boot.raw.unsafe(
@@ -183,7 +187,7 @@ describe('anti-catch-up and the daily cap', () => {
     );
   });
 
-  it('no sequence of concurrent ticks can exceed 24 slots per day', async () => {
+  it('no sequence of concurrent ticks can exceed the daily posting target', async () => {
     const { now, date } = endOfPreviousJakartaDay();
     await withTwoProcesses(
       async (a, b, boot) => {
@@ -194,19 +198,19 @@ describe('anti-catch-up and the daily cap', () => {
 
         const jobs = await jobRows(boot, date);
         expect(jobs.length).toBeGreaterThanOrEqual(1);
-        expect(jobs.length).toBeLessThanOrEqual(24);
+        expect(jobs.length).toBeLessThanOrEqual(4); // PART 6 §7: at most the target
 
         const slots = (await boot.raw.unsafe(
           `select slot_key, count(*)::int as count from slot_contents group by slot_key`,
         )) as unknown as { slot_key: string; count: number }[];
-        expect(slots.length).toBeLessThanOrEqual(24);
+        expect(slots.length).toBeLessThanOrEqual(4);
         for (const row of slots) expect(row.count).toBe(1);
       },
       { now: () => now },
     );
   });
 
-  it('the cadence comes from the 60-minute interval (one slot per hour, not more)', async () => {
+  it('a tick runs at most one slot (anti-catch-up), scheduled at a WIB window', async () => {
     const { now, date } = endOfPreviousJakartaDay();
     await withTwoProcesses(
       async (a, b, boot) => {

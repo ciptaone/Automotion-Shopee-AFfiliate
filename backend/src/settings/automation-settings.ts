@@ -1,16 +1,18 @@
 /**
- * Runtime automation settings (Part 2).
+ * Runtime automation settings (Part 2, extended in Part 6).
  *
  * These are the values the APK's Automation Settings screen reads and writes:
- * posting interval, daily slot limit, per-platform enablement, the image-count
- * policy and the running/paused state of the automation.
+ * posting cadence, per-platform enablement, the image-count policy, the
+ * product selection mode, the running/paused state, and — since PART 6 §7 —
+ * the daily posting target (3 or 4 posts in the four allowed WIB windows) and
+ * the optional generation budgets (§10).
  *
  * Design rules:
  *  - The backend is the single source of truth. The APK never persists an
  *    authoritative copy; it only mirrors what the backend returns.
  *  - Values are validated server-side against the LOCKED product decisions:
- *    at most 24 slots per Asia/Jakarta day, and a schedule that fits inside a
- *    single calendar day.
+ *    at most 4 posts per Asia/Jakarta day inside the allowed windows, and a
+ *    schedule that fits inside a single calendar day.
  *  - Persistence is pluggable: a file-backed store by default (no database
  *    required), an in-memory store for tests. A PostgreSQL-backed store can be
  *    dropped in later without changing any caller, because everything talks to
@@ -22,6 +24,12 @@ import { z } from 'zod';
 import { atomicWriteText, createSerialQueue } from '../core/atomic-file.js';
 import { AppError } from '../core/errors.js';
 import type { ValidationIssue } from '../core/errors.js';
+import {
+  DEFAULT_DAILY_POST_TARGET,
+  MAX_DAILY_POST_TARGET,
+  MIN_DAILY_POST_TARGET,
+  POSTING_WINDOWS,
+} from '../scheduler/slots.js';
 
 /* -------------------------------------------------------------------------- */
 /*  Locked value space                                                        */
@@ -60,6 +68,12 @@ export interface AutomationSettings {
   readonly selectionMode: SelectionMode;
   /** Stable category ids from the imported catalog (only used in selected_categories mode). */
   readonly selectedCategoryIds: readonly string[];
+  /** PART 6 §7 — posts per Asia/Jakarta day (3 or 4, default 4). */
+  readonly dailyPostTarget: number;
+  /** PART 6 §10 — optional daily generation budget in USD (null = unlimited). */
+  readonly dailyBudgetUsd: number | null;
+  /** PART 6 §10 — optional monthly generation budget in USD (null = unlimited). */
+  readonly monthlyBudgetUsd: number | null;
 }
 
 /** Everything EXCEPT the run state (state changes go through `control()`). */
@@ -78,6 +92,11 @@ export const DEFAULT_AUTOMATION_SETTINGS: AutomationSettings = {
   // categories unless the operator explicitly narrows the selection.
   selectionMode: 'auto',
   selectedCategoryIds: [],
+  // PART 6 §7: four posts per day by default (3 is the minimum allowed).
+  dailyPostTarget: DEFAULT_DAILY_POST_TARGET,
+  // PART 6 §10: budgets are opt-in; null means "no configured limit".
+  dailyBudgetUsd: null,
+  monthlyBudgetUsd: null,
 };
 
 /** Machine-readable constraints, surfaced to the APK so it can validate offline. */
@@ -89,11 +108,22 @@ export const SETTINGS_CONSTRAINTS = {
   automationActions: AUTOMATION_ACTIONS,
   selectionModes: SELECTION_MODES,
   slotsMustFitOneDay: true,
+  // PART 6 §7
+  minDailyPostTarget: MIN_DAILY_POST_TARGET,
+  maxDailyPostTarget: MAX_DAILY_POST_TARGET,
+  defaultDailyPostTarget: DEFAULT_DAILY_POST_TARGET,
+  postingWindows: POSTING_WINDOWS.map((window) => window.label),
 } as const;
 
 /* -------------------------------------------------------------------------- */
 /*  Validation                                                                */
 /* -------------------------------------------------------------------------- */
+
+const budgetSchema = z
+  .number()
+  .nonnegative('budgets must not be negative')
+  .max(1_000_000, 'budget is unreasonably large')
+  .nullable();
 
 const settingsObjectSchema = z.object({
   intervalMinutes: z.number().int().min(MIN_INTERVAL_MINUTES).max(MAX_INTERVAL_MINUTES),
@@ -109,6 +139,16 @@ const settingsObjectSchema = z.object({
     .array(z.string().trim().min(1).max(64))
     .max(100)
     .default([]),
+  // PART 6 §7: 3 or 4 posts per day inside the four allowed WIB windows.
+  dailyPostTarget: z
+    .number()
+    .int()
+    .min(MIN_DAILY_POST_TARGET)
+    .max(MAX_DAILY_POST_TARGET)
+    .default(DEFAULT_DAILY_POST_TARGET),
+  // PART 6 §10: optional generation budgets (null = no configured limit).
+  dailyBudgetUsd: budgetSchema.default(null),
+  monthlyBudgetUsd: budgetSchema.default(null),
 });
 
 const settingsSchema = settingsObjectSchema.superRefine((value, ctx) => {

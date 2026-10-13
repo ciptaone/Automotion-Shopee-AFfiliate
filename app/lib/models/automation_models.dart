@@ -62,6 +62,9 @@ class AutomationSettings {
     required this.automationState,
     required this.selectionMode,
     required this.selectedCategoryIds,
+    this.dailyPostTarget = 4,
+    this.dailyBudgetUsd,
+    this.monthlyBudgetUsd,
   });
 
   /// Locked defaults, mirrored from the backend contract.
@@ -75,6 +78,11 @@ class AutomationSettings {
     automationState: AutomationState.paused,
     selectionMode: SelectionMode.auto,
     selectedCategoryIds: <String>[],
+    // PART 6 §7: four WIB windows per day by default.
+    dailyPostTarget: 4,
+    // PART 6 §10: budgets are opt-in; null = no configured limit.
+    dailyBudgetUsd: null,
+    monthlyBudgetUsd: null,
   );
 
   final int intervalMinutes;
@@ -92,6 +100,15 @@ class AutomationSettings {
   /// Stable category ids from the imported catalog (selected-categories mode).
   final List<String> selectedCategoryIds;
 
+  /// PART 6 §7 — posts per Asia/Jakarta day (3 or 4, default 4).
+  final int dailyPostTarget;
+
+  /// PART 6 §10 — optional daily generation budget in USD (null = unlimited).
+  final double? dailyBudgetUsd;
+
+  /// PART 6 §10 — optional monthly generation budget in USD (null = unlimited).
+  final double? monthlyBudgetUsd;
+
   factory AutomationSettings.fromJson(Map<String, dynamic> json) =>
       AutomationSettings(
         intervalMinutes: (json['intervalMinutes'] as num?)?.toInt() ?? defaults.intervalMinutes,
@@ -108,7 +125,20 @@ class AutomationSettings {
                 ?.map((e) => e.toString())
                 .toList() ??
             const [],
+        dailyPostTarget: _clampDailyTarget(
+          (json['dailyPostTarget'] as num?)?.toInt(),
+        ),
+        dailyBudgetUsd: (json['dailyBudgetUsd'] as num?)?.toDouble(),
+        monthlyBudgetUsd: (json['monthlyBudgetUsd'] as num?)?.toDouble(),
       );
+
+  /// Backend rule: only 3 or 4 posts per day are allowed; anything else falls
+  /// back to the default so an older/newer backend can never break the APK.
+  static int _clampDailyTarget(int? raw) {
+    if (raw == 3) return 3;
+    if (raw == 4) return 4;
+    return defaults.dailyPostTarget;
+  }
 
   Map<String, dynamic> toJson() => <String, dynamic>{
         'intervalMinutes': intervalMinutes,
@@ -120,6 +150,9 @@ class AutomationSettings {
         'automationState': automationState.wireValue,
         'selectionMode': selectionMode.wireValue,
         'selectedCategoryIds': selectedCategoryIds,
+        'dailyPostTarget': dailyPostTarget,
+        'dailyBudgetUsd': dailyBudgetUsd,
+        'monthlyBudgetUsd': monthlyBudgetUsd,
       };
 
   AutomationSettings copyWith({
@@ -132,6 +165,11 @@ class AutomationSettings {
     AutomationState? automationState,
     SelectionMode? selectionMode,
     List<String>? selectedCategoryIds,
+    int? dailyPostTarget,
+    double? dailyBudgetUsd,
+    double? monthlyBudgetUsd,
+    bool clearDailyBudget = false,
+    bool clearMonthlyBudget = false,
   }) =>
       AutomationSettings(
         intervalMinutes: intervalMinutes ?? this.intervalMinutes,
@@ -145,6 +183,10 @@ class AutomationSettings {
         selectionMode: selectionMode ?? this.selectionMode,
         selectedCategoryIds:
             selectedCategoryIds ?? this.selectedCategoryIds,
+        dailyPostTarget: dailyPostTarget ?? this.dailyPostTarget,
+        dailyBudgetUsd: clearDailyBudget ? null : (dailyBudgetUsd ?? this.dailyBudgetUsd),
+        monthlyBudgetUsd:
+            clearMonthlyBudget ? null : (monthlyBudgetUsd ?? this.monthlyBudgetUsd),
       );
 
   /// Client-side mirror of the backend's cross-field rule.
@@ -172,12 +214,22 @@ class SettingsConstraints {
     required this.maxIntervalMinutes,
     required this.maxSlotsPerDay,
     required this.imageCountPolicies,
+    required this.minDailyPostTarget,
+    required this.maxDailyPostTarget,
+    required this.defaultDailyPostTarget,
+    required this.postingWindows,
   });
 
   final int minIntervalMinutes;
   final int maxIntervalMinutes;
   final int maxSlotsPerDay;
   final List<String> imageCountPolicies;
+
+  /// PART 6 §7 — daily posting target bounds (3..4) and the four WIB windows.
+  final int minDailyPostTarget;
+  final int maxDailyPostTarget;
+  final int defaultDailyPostTarget;
+  final List<String> postingWindows;
 
   factory SettingsConstraints.fromJson(Map<String, dynamic> json) =>
       SettingsConstraints(
@@ -188,6 +240,19 @@ class SettingsConstraints {
                 ?.map((e) => e.toString())
                 .toList() ??
             const [],
+        minDailyPostTarget: (json['minDailyPostTarget'] as num?)?.toInt() ?? 3,
+        maxDailyPostTarget: (json['maxDailyPostTarget'] as num?)?.toInt() ?? 4,
+        defaultDailyPostTarget:
+            (json['defaultDailyPostTarget'] as num?)?.toInt() ?? 4,
+        postingWindows: (json['postingWindows'] as List?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            const [
+              '06:00-07:00 WIB',
+              '12:00-13:00 WIB',
+              '16:00-17:00 WIB',
+              '19:00-20:00 WIB',
+            ],
       );
 }
 

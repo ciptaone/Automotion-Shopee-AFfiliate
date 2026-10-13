@@ -91,6 +91,33 @@ export const EDITORIAL_LIMITATIONS =
 
 export const MANDATORY_ENDING = MANDATORY_FINAL_HASHTAGS;
 
+/**
+ * PART 6 — centralized normalization of the mandatory ending.
+ *
+ * Applied identically to EVERY text provider's raw output (mock adapters and
+ * live adapters alike) so the locked contract "ends exactly with
+ * `#ai #automation`, nothing after it" is a backend guarantee rather than a
+ * per-provider hope:
+ *   - text after a `#automation` token is cut,
+ *   - `#ai` is ensured immediately before `#automation`,
+ *   - the ending is appended when the model omitted it entirely.
+ *
+ * This changes FORMATTING only — wording, facts and the affiliate URL are
+ * untouched, and the publish gate still re-validates every caption.
+ */
+export function ensureMandatoryEnding(text: string): string {
+  const trimmed = text.replace(/\s+$/, '');
+  const lower = trimmed.toLowerCase();
+  const marker = '#automation';
+  const idx = lower.lastIndexOf(marker);
+  if (idx !== -1) {
+    const head = trimmed.slice(0, idx).replace(/\s+$/, '');
+    const withAi = head.toLowerCase().endsWith('#ai') ? head : `${head} #ai`;
+    return `${withAi} #automation`;
+  }
+  return `${trimmed} ${MANDATORY_ENDING}`.replace(/\s+$/, '');
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Normalization                                                             */
 /* -------------------------------------------------------------------------- */

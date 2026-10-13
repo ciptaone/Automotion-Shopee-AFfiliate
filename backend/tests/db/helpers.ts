@@ -51,7 +51,8 @@ export async function resetDatabase(db: Database): Promise<void> {
   await db.execute(sql`
     truncate table
       jobs, slot_contents, publish_runs, products, import_batches,
-      app_settings, scheduler_checkpoints, notifications, api_clients
+      app_settings, scheduler_checkpoints, notifications, api_clients,
+      provider_workspaces, provider_secrets, generation_usage
     restart identity cascade`);
 }
 

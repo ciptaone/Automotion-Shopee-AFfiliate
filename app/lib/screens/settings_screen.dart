@@ -25,6 +25,8 @@ class SettingsScreen extends StatefulWidget {
 class _SettingsScreenState extends State<SettingsScreen> {
   final _intervalController = TextEditingController();
   final _slotsController = TextEditingController();
+  final _dailyBudgetController = TextEditingController();
+  final _monthlyBudgetController = TextEditingController();
   final _formKey = GlobalKey<FormState>();
 
   bool _loading = true;
@@ -39,6 +41,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _telegramEnabled = true;
   ImageCountPolicy _policy = ImageCountPolicy.defaultValue;
   AutomationState _state = AutomationState.paused;
+
+  /* --- Part 6 §7: daily posting target (3 or 4 per WIB day) ------------ */
+  int _dailyPostTarget = 4;
 
   /* --- Part 3: product selection -------------------------------------- */
   SelectionMode _selectionMode = SelectionMode.auto;
@@ -58,6 +63,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void dispose() {
     _intervalController.dispose();
     _slotsController.dispose();
+    _dailyBudgetController.dispose();
+    _monthlyBudgetController.dispose();
     super.dispose();
   }
 
@@ -68,6 +75,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
         maxIntervalMinutes: 720,
         maxSlotsPerDay: 24,
         imageCountPolicies: ImageCountPolicy.wireValues,
+        minDailyPostTarget: 3,
+        maxDailyPostTarget: 4,
+        defaultDailyPostTarget: 4,
+        postingWindows: <String>[
+          '06:00-07:00 WIB',
+          '12:00-13:00 WIB',
+          '16:00-17:00 WIB',
+          '19:00-20:00 WIB',
+        ],
       );
 
   Future<void> _load() async {
@@ -104,6 +120,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _policy = settings.imageCountPolicy;
     _state = settings.automationState;
     _selectionMode = settings.selectionMode;
+    _dailyPostTarget = settings.dailyPostTarget;
+    _dailyBudgetController.text =
+        settings.dailyBudgetUsd == null ? '' : _fmtBudget(settings.dailyBudgetUsd);
+    _monthlyBudgetController.text =
+        settings.monthlyBudgetUsd == null ? '' : _fmtBudget(settings.monthlyBudgetUsd);
     _selectedCategoryIds
       ..clear()
       ..addAll(settings.selectedCategoryIds);
@@ -151,8 +172,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (!_dirty) setState(() => _dirty = true);
   }
 
+  /// Trim trailing zeros: 1.50 -> "1.50", 2.0 -> "2".
+  static String _fmtBudget(double? value) {
+    if (value == null) return '';
+    final fixed = value.toStringAsFixed(2);
+    return fixed.endsWith('.00')
+        ? fixed.substring(0, fixed.length - 3)
+        : fixed;
+  }
+
   int get _interval => int.tryParse(_intervalController.text.trim()) ?? 0;
   int get _slots => int.tryParse(_slotsController.text.trim()) ?? 0;
+
+  double? get _dailyBudget => double.tryParse(_dailyBudgetController.text.trim());
+  double? get _monthlyBudget => double.tryParse(_monthlyBudgetController.text.trim());
 
   String? get _localScheduleIssue {
     if (_interval * _slots > 24 * 60) {
@@ -168,6 +201,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (issue != null) {
       setState(() {
         _issues = [issue];
+        _error = null;
+      });
+      return;
+    }
+    // PART 6 §10: budgets must be valid numbers when provided (empty = none).
+    final budgetIssues = <String>[
+      if (_dailyBudgetController.text.trim().isNotEmpty && _dailyBudget == null)
+        'Daily budget must be a non-negative number (or empty for no limit).',
+      if (_monthlyBudgetController.text.trim().isNotEmpty && _monthlyBudget == null)
+        'Monthly budget must be a non-negative number (or empty for no limit).',
+      if (_dailyBudget != null && _dailyBudget! < 0)
+        'Daily budget must not be negative.',
+      if (_monthlyBudget != null && _monthlyBudget! < 0)
+        'Monthly budget must not be negative.',
+    ];
+    if (budgetIssues.isNotEmpty) {
+      setState(() {
+        _issues = budgetIssues;
         _error = null;
       });
       return;
@@ -201,6 +252,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
       'selectedCategoryIds': _selectionMode == SelectionMode.auto
           ? <String>[]
           : List<String>.unmodifiable(_selectedCategoryIds),
+      // PART 6 §7/§10 — daily posting target and optional budgets.
+      'dailyPostTarget': _dailyPostTarget,
+      'dailyBudgetUsd': _dailyBudget,
+      'monthlyBudgetUsd': _monthlyBudget,
     };
 
     try {
@@ -335,6 +390,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             InlineErrorBanner(message: 'Settings rejected:\n${_issues.join('\n')}'),
           _controlCard(),
           _scheduleCard(),
+          _dailyPlanCard(),
           _selectionCard(),
           _destinationsCard(),
           _contentCard(),
@@ -447,6 +503,118 @@ class _SettingsScreenState extends State<SettingsScreen> {
           const SizedBox(height: 8),
           Text(issue, style: TextStyle(color: scheme.error, fontSize: 12.5)),
         ],
+      ],
+    );
+  }
+
+  /// PART 6 §7/§10 — daily posting target (3 or 4), the four WIB windows and
+  /// the optional generation budgets.
+  Widget _dailyPlanCard() {
+    final scheme = Theme.of(context).colorScheme;
+    final windows = _constraints.postingWindows;
+    return SectionCard(
+      title: 'Daily posting plan',
+      icon: Icons.event_available_rounded,
+      children: [
+        Text(
+          'How many posts the backend schedules per Asia/Jakarta day, inside '
+          'the allowed WIB windows.',
+          style: Theme.of(context)
+              .textTheme
+              .bodySmall
+              ?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+        const SizedBox(height: 12),
+        SegmentedButton<int>(
+          segments: [
+            for (final target in const [3, 4])
+              ButtonSegment<int>(
+                value: target,
+                label: Text('$target post${target == 1 ? '' : 's'}'),
+              ),
+          ],
+          selected: {_dailyPostTarget},
+          showSelectedIcon: false,
+          onSelectionChanged: (selection) {
+            setState(() => _dailyPostTarget = selection.first);
+            _markDirty();
+          },
+        ),
+        const SizedBox(height: 12),
+        Text(
+          'Posting windows (WIB):',
+          style: Theme.of(context)
+              .textTheme
+              .labelMedium
+              ?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 6,
+          runSpacing: 6,
+          children: [
+            for (var i = 0; i < windows.length; i += 1)
+              StatusChip(
+                label: windows[i],
+                color: i < _dailyPostTarget ? Colors.green : Colors.grey,
+                icon: i < _dailyPostTarget
+                    ? Icons.check_circle_outline_rounded
+                    : Icons.remove_circle_outline_rounded,
+              ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Text(
+          _dailyPostTarget == 4
+              ? 'All four windows are used. The first N windows of the day are selected deterministically.'
+              : 'The first 3 windows (morning, midday, afternoon) are used; the evening window is skipped.',
+          style: Theme.of(context)
+              .textTheme
+              .bodySmall
+              ?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+        const Divider(height: 24),
+        TextFormField(
+          controller: _dailyBudgetController,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: const InputDecoration(
+            labelText: 'Daily budget (USD)',
+            helperText: 'Empty = no configured limit. Generation is blocked once exhausted.',
+            border: OutlineInputBorder(),
+            prefixIcon: Icon(Icons.savings_outlined),
+          ),
+          onChanged: (_) => _markDirty(),
+          validator: (value) {
+            final text = (value ?? '').trim();
+            if (text.isEmpty) return null;
+            final parsed = double.tryParse(text);
+            if (parsed == null || parsed < 0) {
+              return 'Enter a non-negative number, or leave empty';
+            }
+            return null;
+          },
+        ),
+        const SizedBox(height: 12),
+        TextFormField(
+          controller: _monthlyBudgetController,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          decoration: const InputDecoration(
+            labelText: 'Monthly budget (USD)',
+            helperText: 'Empty = no configured limit. Spent totals persist across restarts.',
+            border: OutlineInputBorder(),
+            prefixIcon: Icon(Icons.account_balance_wallet_outlined),
+          ),
+          onChanged: (_) => _markDirty(),
+          validator: (value) {
+            final text = (value ?? '').trim();
+            if (text.isEmpty) return null;
+            final parsed = double.tryParse(text);
+            if (parsed == null || parsed < 0) {
+              return 'Enter a non-negative number, or leave empty';
+            }
+            return null;
+          },
+        ),
       ],
     );
   }

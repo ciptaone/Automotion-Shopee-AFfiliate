@@ -51,6 +51,30 @@ import { ShopeeFeedCsvImporter } from '../integrations/feed/shopee-feed-importer
 import { createCaptionGenerator, createImageGenerator } from '../integrations/ai/create-ai.js';
 import { MemoryObjectStorage } from '../integrations/storage/object-storage.js';
 import {
+  FileProviderStore,
+  InMemoryProviderStore,
+  PostgresProviderStore,
+  type ProviderStore,
+} from '../providers/provider-store.js';
+import {
+  cipherFromEnv,
+  FileSecretStore,
+  InMemorySecretStore,
+  PostgresSecretStore,
+  type SecretStore,
+} from '../secrets/secret-store.js';
+import {
+  FileUsageStore,
+  InMemoryUsageStore,
+  PostgresUsageStore,
+  type UsageStore,
+} from '../usage/usage-store.js';
+import { UsageService } from '../usage/usage-service.js';
+import { ProviderService } from '../providers/provider-service.js';
+import { EndpointPolicy, parseAllowlist } from '../providers/endpoint-policy.js';
+import { HttpTransport } from '../providers/transport.js';
+import { createGenerationRouter, type GenerationRouter } from '../providers/generation-router.js';
+import {
   FacebookPagePublisher,
   StubGraphTransport,
   ThreadsPublisher,
@@ -58,6 +82,7 @@ import {
 import { MemoryTelegramTransport, TelegramNotifier } from '../integrations/notifications/telegram.js';
 import {
   DEFAULT_SCHEDULER_CONFIG,
+  clampDailyPostTarget,
   describeSchedulerStatus,
   type SchedulerConfig,
   type SchedulerStatus,
@@ -96,6 +121,14 @@ export interface AppContainer {
   readonly queue: JobQueue;
   readonly settings: SettingsService;
   readonly feedImporter: ProductFeedImporter;
+  /** PART 6: user-configured provider workspace (configs + selection + readiness). */
+  readonly providers: ProviderService;
+  /** PART 6: generation usage ledger + budget enforcement (§10). */
+  readonly usage: UsageService;
+  /** PART 6: SSRF-safe endpoint policy applied to every configured URL. */
+  readonly endpointPolicy: EndpointPolicy;
+  /** PART 6: provider-aware generation router (attribution + no-fallback). */
+  readonly generationRouter: GenerationRouter;
   readonly imageGenerator: ImageGenerator;
   readonly captionGenerator: CaptionGenerator;
   readonly storage: ObjectStorage;
@@ -152,6 +185,12 @@ export interface BuildContainerOptions {
     notifier: Notifier;
     database: DatabaseHandle;
     schedulerCheckpoints?: SchedulerCheckpointStore;
+    providerStore?: ProviderStore;
+    secretStore?: SecretStore;
+    usageStore?: UsageStore;
+    endpointPolicy?: EndpointPolicy;
+    /** Test seam: deterministic transport instead of global fetch. */
+    transport?: HttpTransport;
   }>;
 }
 
@@ -164,6 +203,7 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     timezone: env.SCHEDULER_TIMEZONE,
     intervalMinutes: env.SCHEDULER_INTERVAL_MINUTES,
     maxSlotsPerDay: env.SCHEDULER_MAX_SLOTS_PER_DAY,
+    dailyPostTarget: env.SCHEDULER_DAILY_POST_TARGET,
   };
 
   /* --- Persistence backend (Part 5: explicit, fail-closed) --- */
@@ -198,6 +238,8 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     intervalMinutes: clampInterval(env.SCHEDULER_INTERVAL_MINUTES),
     maxSlotsPerDay: clampMaxSlots(env.SCHEDULER_INTERVAL_MINUTES, env.SCHEDULER_MAX_SLOTS_PER_DAY),
     automationState: env.SCHEDULER_ENABLED === 'true' ? ('running' as const) : ('paused' as const),
+    // PART 6 §7: how many of the four WIB windows are used each day.
+    dailyPostTarget: clampDailyPostTarget(env.SCHEDULER_DAILY_POST_TARGET),
   };
 
   const settingsStore: SettingsStore =
@@ -252,6 +294,8 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
       ...schedulerConfig,
       intervalMinutes: current.intervalMinutes,
       maxSlotsPerDay: current.maxSlotsPerDay,
+      // PART 6 §7: the daily posting target drives the WIB window slots.
+      dailyPostTarget: clampDailyPostTarget(current.dailyPostTarget),
     };
   };
 
@@ -269,11 +313,84 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     warn: (fields: Record<string, unknown>, message: string) => logger.warn(fields, message),
     error: (fields: Record<string, unknown>, message: string) => logger.error(fields, message),
   };
+  /* --- PART 6: provider workspace, secrets, usage ledger, endpoint policy --- */
+  // Every user-configured endpoint is validated by this policy (SSRF defense)
+  // before it is stored and again before it is fetched.
+  const endpointPolicy =
+    options.overrides?.endpointPolicy ??
+    new EndpointPolicy({ allowlist: parseAllowlist(env.SELF_HOSTED_ENDPOINT_ALLOWLIST) });
+  const transport =
+    options.overrides?.transport ?? new HttpTransport({ policy: endpointPolicy });
+
+  // Credentials: AES-256-GCM with a server-side key. No key => writes fail
+  // closed and providers needing a credential stay unusable (never a fallback).
+  const secretCipher = cipherFromEnv(env.SECRETS_ENCRYPTION_KEY);
+  const secretStore: SecretStore =
+    options.overrides?.secretStore ??
+    (postgresDb
+      ? new PostgresSecretStore(postgresDb, secretCipher)
+      : isTest
+        ? new InMemorySecretStore(secretCipher)
+        : new FileSecretStore(
+            path.join(process.cwd(), 'data', 'provider-secrets.enc.json'),
+            secretCipher,
+          ));
+
+  const providerStore: ProviderStore =
+    options.overrides?.providerStore ??
+    (postgresDb
+      ? new PostgresProviderStore(postgresDb)
+      : isTest
+        ? new InMemoryProviderStore()
+        : new FileProviderStore(path.join(process.cwd(), 'data', 'providers.json')));
+
+  const usageStore: UsageStore =
+    options.overrides?.usageStore ??
+    (postgresDb
+      ? new PostgresUsageStore(postgresDb)
+      : isTest
+        ? new InMemoryUsageStore()
+        : new FileUsageStore(path.join(process.cwd(), 'data', 'usage.json')));
+
+  const usage = new UsageService(
+    usageStore,
+    () => ({
+      dailyBudgetUsd: settings.current().dailyBudgetUsd,
+      monthlyBudgetUsd: settings.current().monthlyBudgetUsd,
+    }),
+    env.SCHEDULER_TIMEZONE,
+  );
+
+  const providers = new ProviderService({
+    store: providerStore,
+    secrets: secretStore,
+    policy: endpointPolicy,
+    transport,
+    usage,
+  });
+  // Warm the persisted workspace off the critical path so synchronous `info`
+  // readers (health/integration status) reflect the selection after boot.
+  void providers.init().catch((error: unknown) => {
+    logger.warn({ err: error }, 'provider workspace could not be loaded at boot');
+  });
+
+  // Env-configured defaults (mock / disabled / unavailable) — used ONLY when no
+  // provider is selected for a task; never as a silent fallback after a failure.
+  const envImageGenerator = createImageGenerator(env, { logger: aiLogger });
+  const envCaptionGenerator = createCaptionGenerator(env, { logger: aiLogger });
+
+  const generationRouter = createGenerationRouter({
+    providers,
+    usage,
+    defaultCaption: envCaptionGenerator,
+    defaultImage: envImageGenerator,
+  });
+
   const imageGenerator =
-    options.overrides?.imageGenerator ?? createImageGenerator(env, { logger: aiLogger });
+    options.overrides?.imageGenerator ?? generationRouter.forImage();
 
   const captionGenerator =
-    options.overrides?.captionGenerator ?? createCaptionGenerator(env, { logger: aiLogger });
+    options.overrides?.captionGenerator ?? generationRouter.forCaption();
 
   const storage =
     options.overrides?.storage ??
@@ -355,6 +472,10 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     queue,
     settings,
     feedImporter,
+    providers,
+    usage,
+    endpointPolicy,
+    generationRouter,
     imageGenerator,
     captionGenerator,
     storage,

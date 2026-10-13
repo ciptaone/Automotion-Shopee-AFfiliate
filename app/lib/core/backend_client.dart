@@ -71,6 +71,10 @@ class BackendClient {
   Future<Map<String, dynamic>> postAuthed(String path, Map<String, dynamic> body) =>
       _authed('POST', path, body: body);
 
+  /// DELETE an authenticated endpoint (provider/credential removal).
+  Future<Map<String, dynamic>> deleteAuthed(String path) =>
+      _authed('DELETE', path);
+
   /// Exchange the stored install key for a fresh session token.
   Future<TokenResponse> redeemInstallKey(String installKey) async {
     final uri = Uri.parse('$baseUrl/v1/auth/token');
@@ -155,6 +159,8 @@ class BackendClient {
           return _http.put(uri, headers: headers, body: jsonEncode(body ?? const {}));
         case 'POST':
           return _http.post(uri, headers: headers, body: jsonEncode(body ?? const {}));
+        case 'DELETE':
+          return _http.delete(uri, headers: headers);
         case 'GET':
         default:
           return _http.get(uri, headers: headers);

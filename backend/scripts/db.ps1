@@ -99,7 +99,7 @@ function Ensure-Helper {
     Set-LocalUser -Name $helperName -Password $secure
   } else {
     New-LocalUser -Name $helperName -Password $secure -AccountNeverExpires `
-      -PasswordNeverExpires -Description 'Shopee Affiliate Autopilot PART 5 PostgreSQL test harness' | Out-Null
+      -PasswordNeverExpires -Description 'PG test harness (PART 5/6)' | Out-Null
   }
   $account = Get-LocalUser -Name $helperName -ErrorAction Stop
   $sid = $account.SID.Value

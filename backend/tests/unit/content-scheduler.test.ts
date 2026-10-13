@@ -1,7 +1,8 @@
 /**
  * PART 4 — scheduler → queue → pipeline integration.
  *
- * Covers: due-slot planning (60-minute interval, ≤24 slots/day), the paused
+ * Covers: due-slot planning (PART 6 §7: 3–4 fixed WIB windows per day), the
+ * paused
  * gate, bounded catch-up after downtime (NO posting burst), persistent and
  * idempotent job identities (no duplicate slots), terminal slots never being
  * re-run (no republish), skip-with-reason when no product is eligible,
@@ -103,9 +104,9 @@ function clockAt(iso: string): TestClock {
   };
 }
 
-/** 10:30 Asia/Jakarta on 2026-10-12 → slots #01..#11 (hours 0..10) are due. */
-const START_ISO = '2026-10-12T10:30:00+07:00';
-const DUE_SLOT_KEY = '2026-10-12#11';
+/** 19:30 Asia/Jakarta on 2026-10-12 → all four window slots are due. */
+const START_ISO = '2026-10-12T19:30:00+07:00';
+const DUE_SLOT_KEY = '2026-10-12#04';
 
 /* -------------------------------------------------------------------------- */
 /*  Test doubles                                                              */
@@ -215,53 +216,73 @@ async function harness(
 /*  Slot planning (pure)                                                      */
 /* ========================================================================== */
 
-describe('dueSlotsFor — due-slot planning', () => {
-  it('returns today\'s slots whose instant has passed, oldest first', () => {
+describe('dueSlotsFor — due-slot planning (PART 6 §7 windows)', () => {
+  it('returns today\'s window slots whose instant has passed, oldest first', () => {
     const { due, today } = dueSlotsFor(DEFAULT_SCHEDULER_CONFIG, new Date(START_ISO));
     expect(today).toBe('2026-10-12');
-    // Hours 0..10 inclusive are due at 10:30 local.
-    expect(due).toHaveLength(11);
+    // At 19:30 WIB all four window slots (06, 12, 16, 19) have passed.
+    expect(due).toHaveLength(4);
     expect(due[0]?.slot.key).toBe('2026-10-12#01');
-    expect(due[10]?.slot.key).toBe(DUE_SLOT_KEY);
+    expect(due[3]?.slot.key).toBe(DUE_SLOT_KEY);
     for (let i = 1; i < due.length; i += 1) {
       expect(due[i]!.instantMs).toBeGreaterThan(due[i - 1]!.instantMs);
     }
   });
 
-  it('honors the 60-minute interval exactly', () => {
+  it('spaces due slots exactly at the four WIB window starts', () => {
     const { due } = dueSlotsFor(DEFAULT_SCHEDULER_CONFIG, new Date(START_ISO));
-    const HOUR = 60 * 60 * 1000;
-    for (let i = 1; i < due.length; i += 1) {
-      expect(due[i]!.instantMs - due[i - 1]!.instantMs).toBe(HOUR);
-    }
+    expect(due.map((entry) => new Date(entry.instantMs).toISOString())).toEqual([
+      '2026-10-11T23:00:00.000Z', // 06:00 WIB
+      '2026-10-12T05:00:00.000Z', // 12:00 WIB
+      '2026-10-12T09:00:00.000Z', // 16:00 WIB
+      '2026-10-12T12:00:00.000Z', // 19:00 WIB
+    ]);
   });
 
-  it('caps a day at 24 slots even when the clock is at 23:59', () => {
+  it('caps a day at the daily target even when the clock is at 23:59', () => {
     const { due } = dueSlotsFor(
       DEFAULT_SCHEDULER_CONFIG,
       new Date('2026-10-12T23:59:00+07:00'),
     );
-    expect(due).toHaveLength(24);
-    expect(due[23]?.slot.key).toBe('2026-10-12#24');
+    expect(due).toHaveLength(4);
+    expect(due[3]?.slot.key).toBe('2026-10-12#04');
   });
 
-  it('never yields more than maxSlotsPerDay for a tighter config', () => {
-    const config = { ...DEFAULT_SCHEDULER_CONFIG, maxSlotsPerDay: 6 };
-    const { due } = dueSlotsFor(config, new Date('2026-10-12T23:59:00+07:00'));
-    expect(due).toHaveLength(6);
+  it('never yields more than the daily target for a 3-window config', () => {
+    const three = { ...DEFAULT_SCHEDULER_CONFIG, dailyPostTarget: 3 };
+    const { due } = dueSlotsFor(three, new Date('2026-10-12T23:59:00+07:00'));
+    expect(due).toHaveLength(3);
+    expect(due[2]?.slot.key).toBe('2026-10-12#03');
+  });
+
+  it('ignores the legacy interval/max-slots grid (windows always win)', () => {
+    const dense = { ...DEFAULT_SCHEDULER_CONFIG, intervalMinutes: 10, maxSlotsPerDay: 6 };
+    const { due } = dueSlotsFor(dense, new Date('2026-10-12T23:59:00+07:00'));
+    expect(due).toHaveLength(4);
+    expect(due.map((entry) => new Date(entry.instantMs).toISOString().slice(11, 16))).toEqual([
+      '23:00',
+      '05:00',
+      '09:00',
+      '12:00',
+    ]);
   });
 
   it('is due only at or after the slot instant (never early)', () => {
-    // 09:59 → hour 10 slot (#11) is not yet due.
-    const { due } = dueSlotsFor(
-      DEFAULT_SCHEDULER_CONFIG,
-      new Date('2026-10-12T09:59:59+07:00'),
-    );
-    expect(due).toHaveLength(10);
-    expect(due.some((d) => d.slot.key === DUE_SLOT_KEY)).toBe(false);
-    // Exactly 10:00 → due.
-    const at = dueSlotsFor(DEFAULT_SCHEDULER_CONFIG, new Date('2026-10-12T10:00:00+07:00'));
-    expect(at.due.some((d) => d.slot.key === DUE_SLOT_KEY)).toBe(true);
+    // 05:59:59 → the 06:00 window is not yet due.
+    const early = dueSlotsFor(DEFAULT_SCHEDULER_CONFIG, new Date('2026-10-12T05:59:59+07:00'));
+    expect(early.due).toHaveLength(0);
+    // Exactly 06:00 → due.
+    const at = dueSlotsFor(DEFAULT_SCHEDULER_CONFIG, new Date('2026-10-12T06:00:00+07:00'));
+    expect(at.due.map((entry) => entry.slot.key)).toEqual(['2026-10-12#01']);
+    // 11:59:59 → only the 06:00 window has passed.
+    const mid = dueSlotsFor(DEFAULT_SCHEDULER_CONFIG, new Date('2026-10-12T11:59:59+07:00'));
+    expect(mid.due).toHaveLength(1);
+    // Exactly 12:00 → the second window joins.
+    const noon = dueSlotsFor(DEFAULT_SCHEDULER_CONFIG, new Date('2026-10-12T12:00:00+07:00'));
+    expect(noon.due.map((entry) => entry.slot.key)).toEqual([
+      '2026-10-12#01',
+      '2026-10-12#02',
+    ]);
   });
 });
 
@@ -332,13 +353,13 @@ describe('content scheduler — automation gate', () => {
 
 describe('content scheduler — bounded catch-up (no posting burst)', () => {
   it('runs ONLY the most recent due slot and records the rest as skipped', async () => {
-    // Clock far ahead: all 24 slots of the day are overdue.
+    // Clock far ahead: all four window slots of the day are overdue.
     const h = await harness({ startIso: '2026-10-12T23:30:00+07:00' });
     const result = await h.scheduler.tick();
 
     expect(result.executed).toHaveLength(1);
-    expect(result.enqueued).toEqual(['2026-10-12#24']);
-    expect(result.skipped).toHaveLength(23);
+    expect(result.enqueued).toEqual(['2026-10-12#04']);
+    expect(result.skipped).toHaveLength(3);
     expect(result.skipped.every((s) => s.reason === 'catch_up_limited')).toBe(true);
     // The skipped slots were never enqueued: no back-fill flood.
     expect(await h.queue.list(50)).toHaveLength(1);
@@ -351,8 +372,8 @@ describe('content scheduler — bounded catch-up (no posting burst)', () => {
     });
     const result = await h.scheduler.tick();
     expect(result.executed).toHaveLength(2);
-    expect(result.skipped).toHaveLength(22);
-    expect(result.enqueued).toEqual(['2026-10-12#23', '2026-10-12#24']);
+    expect(result.skipped).toHaveLength(2);
+    expect(result.enqueued).toEqual(['2026-10-12#03', '2026-10-12#04']);
   });
 
   it('keeps at least one slot per tick even with a nonsensical bound', async () => {
@@ -524,22 +545,25 @@ describe('content scheduler — recoverable failures', () => {
   });
 
   it('keeps scheduling FUTURE slots after a failure (does not stop the loop)', async () => {
-    // Fails ONLY its first call: slot #11 fails, everything after recovers.
-    const h = await harness({ imageGenerator: new FailNthCallImageGenerator([1]) });
+    // Fails ONLY its first call: the 12:00 window slot fails, later slots recover.
+    const h = await harness({
+      startIso: '2026-10-12T12:30:00+07:00',
+      imageGenerator: new FailNthCallImageGenerator([1]),
+    });
     const first = await h.scheduler.tick();
     expect(first.failed).toHaveLength(1);
-    expect(first.failed[0]?.slotKey).toBe(DUE_SLOT_KEY);
+    expect(first.failed[0]?.slotKey).toBe('2026-10-12#02');
 
-    // Next hour: the backoff has elapsed, so the failed slot is retried AND a
+    // Next window: the backoff has elapsed, so the failed slot is retried AND a
     // brand-new slot is planned — the loop keeps going after a failure.
-    h.clock.set('2026-10-12T11:30:00+07:00');
+    h.clock.set('2026-10-12T16:30:00+07:00');
     const second = await h.scheduler.tick();
 
-    expect(second.enqueued).toContain('2026-10-12#12');
+    expect(second.enqueued).toContain('2026-10-12#03');
     expect(second.failed).toEqual([]);
     expect(second.executed.map((e) => e.slotKey)).toEqual([
-      DUE_SLOT_KEY,
-      '2026-10-12#12',
+      '2026-10-12#02',
+      '2026-10-12#03',
     ]);
     expect(second.executed.every((e) => e.stage === 'publish_ready')).toBe(true);
     expect(second.pendingJobs).toBe(0);

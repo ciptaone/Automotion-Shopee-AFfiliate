@@ -5,8 +5,11 @@
  *
  * WHAT THIS MODULE DOES (and what it deliberately does NOT do):
  *  - Computes the due content slots for "today" using the already-tested slot
- *    math in `scheduler/slots.ts` (60-minute interval, ≤24 slots per
- *    Asia/Jakarta day) — it does NOT reinvent scheduling.
+ *    math in `scheduler/slots.ts` (PART 6 §7: 3–4 slots per Asia/Jakarta day,
+ *    one per selected WIB window — 06, 12, 16, 19) — it does NOT reinvent
+ *    scheduling. The daily target is enforced as a transactional cap in the
+ *    queue (`dailyCap`), and a slot refused by the cap is recorded as
+ *    `skipped: daily_target_reached`.
  *  - Enqueues each due slot into the existing `JobQueue` under a PERSISTENT
  *    job identity: `content:<slotKey>`. Enqueueing an existing non-terminal
  *    slot is a no-op (the queue's uniqueness contract), so a slot can never be
@@ -40,13 +43,14 @@
  * deployment remains BLOCKED / NOT_TESTED.
  */
 import type { JobQueue, JobRecord } from '../contracts/index.js';
-import { StaleClaimError } from '../core/errors.js';
+import { DailyPostLimitError, StaleClaimError } from '../core/errors.js';
 import type { Logger } from '../core/logger.js';
 import type { ContentPipeline } from '../automation/pipeline.js';
 import type { SettingsService } from '../settings/automation-settings.js';
 import type { SchedulerCheckpointStore } from '../db/postgres-settings-store.js';
 import type { SchedulerTickLock } from '../db/postgres-tick-lock.js';
 import {
+  clampDailyPostTarget,
   computeDailySlots,
   formatInTimeZone,
   localToUtc,
@@ -99,7 +103,7 @@ export interface SlotOutcome {
 
 export interface SkippedSlot {
   readonly slotKey: string;
-  readonly reason: 'catch_up_limited' | 'not_due';
+  readonly reason: 'catch_up_limited' | 'not_due' | 'daily_target_reached';
 }
 
 export interface TickResult {
@@ -356,6 +360,7 @@ export class ContentScheduler {
     }
 
     /* --- Enqueue (persistent identity, idempotent) --------------------- */
+    const dailyTarget = clampDailyPostTarget(config.dailyPostTarget);
     for (const entry of runnable) {
       // Skip slots already in a terminal stage (never republish / regenerate).
       const existing = pipeline.get(entry.slot.key);
@@ -363,17 +368,37 @@ export class ContentScheduler {
         skipped.push({ slotKey: entry.slot.key, reason: 'not_due' });
         continue;
       }
-      const job = await queue.enqueue({
-        kind: CONTENT_JOB_KIND,
-        uniqueKey: contentJobKey(entry.slot.key),
-        scheduledFor: new Date(entry.instantMs).toISOString(),
-        payload: { slotKey: entry.slot.key, scheduledFor: entry.slot.scheduledFor },
-        maxAttempts: 3,
-      });
-      if (!enqueued.includes(entry.slot.key)) {
-        enqueued.push(entry.slot.key);
+      try {
+        const job = await queue.enqueue({
+          kind: CONTENT_JOB_KIND,
+          uniqueKey: contentJobKey(entry.slot.key),
+          scheduledFor: new Date(entry.instantMs).toISOString(),
+          payload: { slotKey: entry.slot.key, scheduledFor: entry.slot.scheduledFor },
+          maxAttempts: 3,
+          // PART 6 §7: the daily posting target is a hard cap. In PostgreSQL
+          // this count+insert runs in one transaction under a per-day advisory
+          // lock, so concurrent workers cannot exceed it.
+          dailyCap: {
+            dayPrefix: `${CONTENT_JOB_KIND_PREFIX}${entry.slot.date}#`,
+            max: dailyTarget,
+          },
+        });
+        if (!enqueued.includes(entry.slot.key)) {
+          enqueued.push(entry.slot.key);
+        }
+        logger?.debug({ slotKey: entry.slot.key, jobId: job.id, status: job.status }, 'slot enqueued');
+      } catch (error) {
+        if (error instanceof DailyPostLimitError) {
+          // Not an error condition: the operator's target for today is met.
+          skipped.push({ slotKey: entry.slot.key, reason: 'daily_target_reached' });
+          logger?.info(
+            { slotKey: entry.slot.key, target: dailyTarget, day: entry.slot.date },
+            'Daily posting target already reached; slot not scheduled.',
+          );
+          continue;
+        }
+        throw error;
       }
-      logger?.debug({ slotKey: entry.slot.key, jobId: job.id, status: job.status }, 'slot enqueued');
     }
 
     /* --- Execute due jobs --------------------------------------------- */

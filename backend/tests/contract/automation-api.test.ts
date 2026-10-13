@@ -82,9 +82,10 @@ describe('GET /v1/automation/status', () => {
       expect(Array.isArray(body.degradedReasons)).toBe(true);
       expect(body.timezone).toBe('Asia/Jakarta');
       expect(body.today).toMatch(/^\d{4}-\d{2}-\d{2}$/);
-      expect(body.slotsScheduled).toBe(24);
+      // PART 6 §7: one slot per selected WIB window (default target 4).
+      expect(body.slotsScheduled).toBe(4);
       expect(body.slotsUsed).toBe(0);
-      expect(body.slotsRemaining).toBe(24);
+      expect(body.slotsRemaining).toBe(4);
 
       // Publication counters come from the live job queue, not fixtures.
       expect(body.publications).toEqual({
@@ -142,7 +143,8 @@ describe('GET /v1/automation/status', () => {
       });
       const body = res.json();
       expect(body.slotsUsed).toBe(3);
-      expect(body.slotsRemaining).toBe(21);
+      // PART 6 §7: the day holds 4 window slots, so 3 used leaves 1.
+      expect(body.slotsRemaining).toBe(1);
       expect(body.publications.succeeded).toBe(1);
       expect(body.publications.failed).toBe(1);
       expect(body.recentActivity.length).toBe(3);
@@ -225,6 +227,8 @@ describe('PUT /v1/settings', () => {
           maxSlotsPerDay: 12,
           facebookEnabled: false,
           imageCountPolicy: 'one',
+          // PART 6 §7: pick the 3-window target and prove the scheduler follows.
+          dailyPostTarget: 3,
         },
       });
       expect(put.statusCode).toBe(200);
@@ -234,6 +238,7 @@ describe('PUT /v1/settings', () => {
         facebookEnabled: false,
         threadsEnabled: true, // untouched keys keep their previous value
         imageCountPolicy: 'one',
+        dailyPostTarget: 3,
       });
 
       // Persistence: a subsequent GET reflects the change.
@@ -248,7 +253,11 @@ describe('PUT /v1/settings', () => {
       });
       expect(status.json().intervalMinutes).toBe(90);
       expect(status.json().maxSlotsPerDay).toBe(12);
-      expect(status.json().slotsToday).toBe(12);
+      expect(status.json().dailyPostTarget).toBe(3);
+      // PART 6 §7: legacy interval/slot fields no longer drive the schedule;
+      // the daily target does — 3 windows (06, 12, 16) for target 3.
+      expect(status.json().slotsToday).toBe(3);
+      expect(status.json().todayWindows).toHaveLength(3);
     } finally {
       await app.close();
     }

@@ -239,7 +239,17 @@ describe('authenticated endpoints', () => {
     });
     expect(res.statusCode).toBe(200);
     const body = res.json();
-    expect(body.slotsToday).toBe(24);
+    // PART 6 §7: a day has exactly one slot per selected WIB window (default
+    // target 4 => the 06/12/16/19 windows), never the old 24-slot grid.
+    expect(body.slotsToday).toBe(4);
+    expect(body.dailyPostTarget).toBe(4);
+    expect(body.postingWindows).toEqual([
+      '06:00-07:00 WIB',
+      '12:00-13:00 WIB',
+      '16:00-17:00 WIB',
+      '19:00-20:00 WIB',
+    ]);
+    expect(body.todayWindows).toHaveLength(4);
     expect(body.timezone).toBe('Asia/Jakarta');
   });
 

@@ -23,12 +23,30 @@
  *  - POST   /v1/pipeline/run         Authenticated (control). Generate content for a slot.
  *  - GET    /v1/pipeline/slots       Authenticated. List pipeline slot records.
  *
+ * PART 6 (custom AI providers + usage):
+ *  - GET    /v1/providers            Authenticated. Providers + capabilities + readiness
+ *                                    + masked secret metadata (never a credential).
+ *  - POST   /v1/providers            Authenticated (control). Create a provider.
+ *  - PUT    /v1/providers/:id        Authenticated (control). Edit a provider.
+ *  - DELETE /v1/providers/:id        Authenticated (control). Delete a deselected provider.
+ *  - GET    /v1/providers/selection  Authenticated. Independent text/image selections.
+ *  - PUT    /v1/providers/selection  Authenticated (control). Set text/image selections.
+ *  - PUT    /v1/providers/:id/secret Authenticated (control). Store/replace a credential
+ *                                    (write-only; the value is never returned).
+ *  - DELETE /v1/providers/:id/secret Authenticated (control). Remove a credential.
+ *  - POST   /v1/providers/:id/test/connection | /test/text | /test/image
+ *                                    Authenticated (control). Bounded tests; never publish.
+ *  - GET    /v1/usage/summary        Authenticated. Generation usage + budget state.
+ *
  * Security invariants:
  *  - No endpoint ever returns a secret value; health/integration output is built
  *    from `describeIntegrationStatus`, which only emits key NAMES + booleans.
  *  - Authenticated routes verify the HS256 JWT, its issuer, audience, expiry and
  *    required scopes.
  *  - CORS is an explicit allow-list derived from CORS_ORIGINS.
+ *  - User-supplied provider URLs are validated by the SSRF endpoint policy BEFORE
+ *    they are stored and again before every outbound request; responses are
+ *    bounded and redirects are refused.
  */
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
@@ -80,6 +98,11 @@ const settingsPatchSchema = z
     telegramNotificationsEnabled: z.boolean().optional(),
     selectionMode: z.enum(SELECTION_MODES).optional(),
     selectedCategoryIds: z.array(z.string().trim().min(1).max(64)).max(100).optional(),
+    /** PART 6 §7: 3 or 4 posts per Asia/Jakarta day (the four WIB windows). */
+    dailyPostTarget: z.number().int().min(3).max(4).optional(),
+    /** PART 6 §10: optional generation budgets in USD (null clears the limit). */
+    dailyBudgetUsd: z.number().nonnegative().max(1_000_000).nullable().optional(),
+    monthlyBudgetUsd: z.number().nonnegative().max(1_000_000).nullable().optional(),
   })
   .strict();
 
@@ -762,6 +785,160 @@ export async function buildServer(container: AppContainer): Promise<FastifyInsta
       count: items.length,
       source: 'fixture',
       note: FIXTURE_HISTORY_NOTE,
+    });
+  });
+
+  /* ---------------------------------------------------------------------- */
+  /*  PART 6: provider workspace (custom AI text/image providers)           */
+  /* ---------------------------------------------------------------------- */
+
+  // List: configuration + capability/readiness + masked secret metadata.
+  // NO endpoint here ever returns a stored credential.
+  app.get('/v1/providers', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['read']);
+    await container.providers.init();
+    const [providers, selection] = await Promise.all([
+      container.providers.list(),
+      container.providers.selection(),
+    ]);
+    return reply.status(200).send({
+      providers,
+      selection,
+      storage: container.providers.storage,
+      secretsStorage: container.providers.secretsStorage,
+      capabilities: [
+        'text_generation',
+        'image_generation',
+        'image_reference_input',
+        'image_editing',
+        'structured_output',
+      ],
+      statuses: [
+        'not_configured',
+        'configuration_invalid',
+        'authentication_failed',
+        'ready',
+        'capability_unsupported',
+        'temporarily_unavailable',
+        'rate_limited',
+        'test_failed',
+      ],
+      note: 'Credentials are encrypted on the backend and are never returned by any endpoint (only masked metadata).',
+    });
+  });
+
+  app.post('/v1/providers', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    await container.providers.init();
+    const provider = await container.providers.create(request.body ?? {});
+    container.logger.info({ providerId: provider.id, name: provider.name }, 'provider created');
+    return reply.status(201).send({ provider });
+  });
+
+  app.get('/v1/providers/selection', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['read']);
+    await container.providers.init();
+    return reply.status(200).send(await container.providers.selection());
+  });
+
+  app.put('/v1/providers/selection', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    await container.providers.init();
+    const selection = await container.providers.setSelection(request.body ?? {});
+    container.logger.info(
+      { textProviderId: selection.textProviderId, imageProviderId: selection.imageProviderId },
+      'provider selection updated',
+    );
+    return reply.status(200).send(selection);
+  });
+
+  app.put('/v1/providers/:id', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    await container.providers.init();
+    const { id } = request.params as { id: string };
+    const provider = await container.providers.update(id, request.body ?? {});
+    return reply.status(200).send({ provider });
+  });
+
+  app.delete('/v1/providers/:id', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    await container.providers.init();
+    const { id } = request.params as { id: string };
+    const result = await container.providers.remove(id);
+    container.logger.info({ providerId: id }, 'provider deleted');
+    return reply.status(200).send({ ...result, providerId: id });
+  });
+
+  // Write-only credential endpoints: the secret value goes IN and is never read
+  // back out (only presence + a masked preview are returned).
+  app.put('/v1/providers/:id/secret', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    await container.providers.init();
+    const { id } = request.params as { id: string };
+    const metadata = await container.providers.setSecret(id, request.body ?? {});
+    container.logger.info({ providerId: id }, 'provider secret stored (value never logged)');
+    return reply.status(200).send({ providerId: id, secret: metadata });
+  });
+
+  app.delete('/v1/providers/:id/secret', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    await container.providers.init();
+    const { id } = request.params as { id: string };
+    const metadata = await container.providers.deleteSecret(id);
+    return reply.status(200).send({ providerId: id, secret: metadata });
+  });
+
+  /* --- Test actions: bounded, sanitized, never publishing --------------- */
+
+  app.post('/v1/providers/:id/test/connection', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    await container.providers.init();
+    const { id } = request.params as { id: string };
+    const result = await container.providers.testConnection(id);
+    return reply.status(200).send(result);
+  });
+
+  app.post('/v1/providers/:id/test/text', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    await container.providers.init();
+    const { id } = request.params as { id: string };
+    const result = await container.providers.testText(id);
+    return reply.status(200).send(result);
+  });
+
+  app.post('/v1/providers/:id/test/image', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    await container.providers.init();
+    const { id } = request.params as { id: string };
+    const result = await container.providers.testImage(id);
+    return reply.status(200).send(result);
+  });
+
+  /* --- Usage + budget (§10) ---------------------------------------------- */
+
+  app.get('/v1/usage/summary', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['read']);
+    const summary = await container.usage.summary();
+    return reply.status(200).send({
+      timezone: container.env.SCHEDULER_TIMEZONE,
+      storage: summary.storage,
+      day: summary.day,
+      month: summary.month,
+      budget: summary.budget,
+      recent: summary.recent,
+      note: 'Cost figures are provider-reported. Requests with no reported cost are counted as "unknown cost".',
     });
   });
 

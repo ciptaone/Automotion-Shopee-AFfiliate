@@ -5,9 +5,10 @@ import 'dashboard_screen.dart';
 import 'history_screen.dart';
 import 'integrations_screen.dart';
 import 'preview_screen.dart';
+import 'providers_screen.dart';
 import 'settings_screen.dart';
 
-/// Root shell after sign-in: five tabs over the control surface.
+/// Root shell after sign-in: six tabs over the control surface.
 ///
 /// Tabs are kept alive in an [IndexedStack] so switching back to the dashboard
 /// does not throw away its state or re-trigger a network call.
@@ -34,6 +35,7 @@ class _HomeShellState extends State<HomeShell> {
     (label: 'Preview', icon: Icons.preview_outlined),
     (label: 'History', icon: Icons.history_outlined),
     (label: 'Services', icon: Icons.hub_outlined),
+    (label: 'AI', icon: Icons.smart_toy_outlined),
   ];
 
   @override
@@ -50,6 +52,7 @@ class _HomeShellState extends State<HomeShell> {
           PreviewScreen(api: api, onSignedOut: onSignedOut),
           HistoryScreen(api: api, onSignedOut: onSignedOut),
           IntegrationsScreen(api: api, onSignedOut: onSignedOut),
+          ProvidersScreen(api: api, onSignedOut: onSignedOut),
         ],
       ),
       bottomNavigationBar: NavigationBar(

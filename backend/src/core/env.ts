@@ -155,6 +155,36 @@ export const envSchema = z
     AI_TEXT_PROVIDER: z.enum(['mock', 'openai', 'google', 'disabled']).default('mock'),
     AI_TEXT_API_KEY: optionalTrimmed,
     AI_TEXT_MODEL: trimmed(1, 128).default('mock-text-v1'),
+
+    /* --- PART 6: custom provider workspace --- */
+    /**
+     * 32-byte AES-256-GCM key for provider secrets, encoded as base64 or hex.
+     * Optional at boot (the app starts without it), but every secret WRITE then
+     * fails closed and providers that need a credential are unusable. There is
+     * no built-in key and no plaintext fallback.
+     */
+    SECRETS_ENCRYPTION_KEY: optionalTrimmed.refine(
+      (v) =>
+        !v ||
+        /^[0-9a-fA-F]{64}$/.test(v) ||
+        Buffer.from(v, 'base64').byteLength === 32,
+      'must be a 32-byte key encoded as base64 or hex',
+    ),
+    /**
+     * Operator allowlist for self-hosted provider endpoints that legitimately
+     * live on private ranges (e.g. `ollama.local:11434`). Comma-separated
+     * hostnames or host:port entries; never client-controlled input.
+     */
+    SELF_HOSTED_ENDPOINT_ALLOWLIST: z.string().trim().default(''),
+    /**
+     * PART 6 §7 — default daily posting target (3 or 4 posts per Asia/Jakarta
+     * day inside the four allowed WIB windows). Operators can change it at
+     * runtime via `/v1/settings`.
+     */
+    SCHEDULER_DAILY_POST_TARGET: z.preprocess(
+      (v) => (typeof v === 'string' && v.trim() !== '' ? Number(v.trim()) : v),
+      z.number().int().min(3).max(4).default(4),
+    ),
   })
   .superRefine((env, ctx) => {
     /* Cross-field invariants. Each adds an issue on the offending KEY only. */

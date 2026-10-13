@@ -129,6 +129,9 @@ Map<String, dynamic> settingsFixture({
   String? warning,
   String selectionMode = 'auto',
   List<String> selectedCategoryIds = const [],
+  int dailyPostTarget = 4,
+  double? dailyBudgetUsd,
+  double? monthlyBudgetUsd,
 }) =>
     {
       'settings': {
@@ -141,6 +144,9 @@ Map<String, dynamic> settingsFixture({
         'automationState': state,
         'selectionMode': selectionMode,
         'selectedCategoryIds': selectedCategoryIds,
+        'dailyPostTarget': dailyPostTarget,
+        'dailyBudgetUsd': dailyBudgetUsd,
+        'monthlyBudgetUsd': monthlyBudgetUsd,
       },
       'defaults': {
         'intervalMinutes': 60,
@@ -152,6 +158,9 @@ Map<String, dynamic> settingsFixture({
         'automationState': 'paused',
         'selectionMode': 'auto',
         'selectedCategoryIds': <String>[],
+        'dailyPostTarget': 4,
+        'dailyBudgetUsd': null,
+        'monthlyBudgetUsd': null,
       },
       'storage': {'kind': storageKind},
       'warning': warning,
@@ -161,6 +170,15 @@ Map<String, dynamic> settingsFixture({
         'maxSlotsPerDay': 24,
         'imageCountPolicies': ['random_1_or_2', 'one', 'two'],
         'selectionModes': ['auto', 'selected_categories'],
+        'minDailyPostTarget': 3,
+        'maxDailyPostTarget': 4,
+        'defaultDailyPostTarget': 4,
+        'postingWindows': [
+          '06:00-07:00 WIB',
+          '12:00-13:00 WIB',
+          '16:00-17:00 WIB',
+          '19:00-20:00 WIB',
+        ],
       },
       'controls': ['start', 'pause', 'resume'],
       'note': 'Settings are persisted by the backend.',
@@ -539,4 +557,235 @@ Map<String, dynamic> pipelinePreviewFixture({
               '$imageCount image(s) + caption validated and ready. Publication is not enabled yet.',
         },
       },
+    };
+
+/* -------------------------------------------------------------------------- */
+/*  Part 6 fixtures: provider workspace, test results, usage summary          */
+/* -------------------------------------------------------------------------- */
+
+Map<String, dynamic> providerViewFixture({
+  String id = 'prov-text-1',
+  String name = 'acme-text',
+  String displayName = 'Acme Text',
+  String adapterType = 'openai_chat_completions',
+  String adapterLabel = 'OpenAI-compatible chat',
+  String baseUrl = 'https://api.acme.example/v1',
+  String model = 'acme-large',
+  String authType = 'bearer',
+  bool enabled = true,
+  Map<String, bool> capabilities = const {'text_generation': true},
+  Map<String, Map<String, dynamic>> readiness = const {
+    'configuration': {
+      'status': 'ready',
+      'testedAt': '2026-10-12T01:00:00.000Z',
+      'detail': 'Configuration validated.',
+      'requestId': null,
+    },
+    'text_generation': {
+      'status': 'ready',
+      'testedAt': '2026-10-12T01:05:00.000Z',
+      'detail': 'Fixture test succeeded.',
+      'requestId': 'req_1',
+    },
+  },
+  bool secretPresent = false,
+  String? secretMasked,
+  bool secretKeyConfigured = true,
+  List<String> selectedFor = const [],
+}) =>
+    {
+      'id': id,
+      'name': name,
+      'displayName': displayName,
+      'adapterType': adapterType,
+      'adapterLabel': adapterLabel,
+      'baseUrl': baseUrl,
+      'model': model,
+      'auth': {'type': authType},
+      'enabled': enabled,
+      'capabilities': capabilities,
+      'readiness': readiness,
+      'secret': {
+        'present': secretPresent,
+        'masked': secretMasked,
+        'keyConfigured': secretKeyConfigured,
+      },
+      'selectedFor': selectedFor,
+      'updatedAt': '2026-10-12T01:00:00.000Z',
+    };
+
+Map<String, dynamic> providersWorkspaceFixture({
+  List<Map<String, dynamic>> providers = const [],
+  String? textProviderId,
+  String? imageProviderId,
+  String? textProviderName,
+  String? imageProviderName,
+}) =>
+    {
+      'providers': providers,
+      'selection': {
+        'textProviderId': textProviderId,
+        'imageProviderId': imageProviderId,
+        'textProviderName': textProviderName,
+        'imageProviderName': imageProviderName,
+        'fallback': 'none',
+        'note':
+            'When the selected provider fails, the pipeline reports the error '
+                'and blocks the slot. It never switches provider.',
+      },
+      'storage': 'memory',
+      'secretsStorage': 'memory_aes256gcm',
+      'capabilities': [
+        'text_generation',
+        'image_generation',
+        'image_reference_input',
+        'image_editing',
+        'structured_output',
+      ],
+      'statuses': [
+        'not_configured',
+        'configuration_invalid',
+        'authentication_failed',
+        'ready',
+        'capability_unsupported',
+        'temporarily_unavailable',
+        'rate_limited',
+        'test_failed',
+      ],
+      'note': 'Credentials are write-only: the backend never returns a secret.',
+    };
+
+Map<String, dynamic> usageSummaryFixture({
+  int dayRequests = 3,
+  int dayFailures = 1,
+  double dayKnownCostUsd = 0.006,
+  int dayUnknownCostRequests = 1,
+  double? dailyBudgetUsd,
+  double? monthlyBudgetUsd,
+  bool budgetBlocked = false,
+  String? blockedScope,
+}) =>
+    {
+      'timezone': 'Asia/Jakarta',
+      'storage': 'memory',
+      'day': {
+        'requests': dayRequests,
+        'failures': dayFailures,
+        'inputTokens': 300,
+        'outputTokens': 150,
+        'images': 2,
+        'knownCostUsd': dayKnownCostUsd,
+        'actualCostUsd': dayKnownCostUsd,
+        'estimatedCostUsd': 0,
+        'unknownCostRequests': dayUnknownCostRequests,
+      },
+      'month': {
+        'requests': dayRequests,
+        'failures': dayFailures,
+        'inputTokens': 300,
+        'outputTokens': 150,
+        'images': 2,
+        'knownCostUsd': dayKnownCostUsd,
+        'actualCostUsd': dayKnownCostUsd,
+        'estimatedCostUsd': 0,
+        'unknownCostRequests': dayUnknownCostRequests,
+      },
+      'budget': {
+        'timezone': 'Asia/Jakarta',
+        'dailyBudgetUsd': dailyBudgetUsd,
+        'monthlyBudgetUsd': monthlyBudgetUsd,
+        'day': {
+          'from': '2026-10-12T00:00:00.000Z',
+          'to': '2026-10-13T00:00:00.000Z',
+          'spentUsd': dayKnownCostUsd,
+          'budgetUsd': dailyBudgetUsd,
+          'exhausted': budgetBlocked,
+        },
+        'month': {
+          'from': '2026-10-01T00:00:00.000Z',
+          'to': '2026-11-01T00:00:00.000Z',
+          'spentUsd': dayKnownCostUsd,
+          'budgetUsd': monthlyBudgetUsd,
+          'exhausted': budgetBlocked,
+        },
+        'blocked': budgetBlocked,
+        'blockedScope': blockedScope,
+        'unknownCostRequests': dayUnknownCostRequests,
+        'note':
+            'Only provider-reported costs count toward the budget; unknown '
+                'costs are surfaced separately.',
+      },
+      'recent': [
+        {
+          'id': 'usage-1',
+          'at': '2026-10-12T03:00:00.000Z',
+          'providerId': 'prov-text-1',
+          'providerName': 'Acme Text',
+          'adapterType': 'openai_chat_completions',
+          'model': 'acme-large',
+          'operation': 'text_generation',
+          'requestId': 'req_1',
+          'status': 'success',
+          'latencyMs': 120,
+          'inputTokens': 100,
+          'outputTokens': 50,
+          'images': null,
+          'costUsd': 0.002,
+          'costKind': 'actual',
+          'errorCode': null,
+        },
+        {
+          'id': 'usage-2',
+          'at': '2026-10-12T03:05:00.000Z',
+          'providerId': null,
+          'providerName': 'env_default_image',
+          'adapterType': 'openai_images',
+          'model': 'mock-image-v1',
+          'operation': 'image_generation',
+          'requestId': 'req_2',
+          'status': 'error',
+          'latencyMs': 42,
+          'inputTokens': null,
+          'outputTokens': null,
+          'images': null,
+          'costUsd': null,
+          'costKind': 'unknown',
+          'errorCode': 'AI_PROVIDER_FAILED',
+        },
+      ],
+      'note':
+          'Per-request ledger. Costs are classified as actual, estimated or '
+              'unknown — never silently treated as zero.',
+    };
+
+Map<String, dynamic> providerTestResultFixture({
+  bool ok = true,
+  String kind = 'connection',
+  String providerId = 'prov-text-1',
+  String status = 'ready',
+  String detail = 'Endpoint responded within the bounded timeout.',
+  Map<String, Map<String, dynamic>> readiness = const {
+    'configuration': {
+      'status': 'ready',
+      'testedAt': '2026-10-12T01:00:00.000Z',
+      'detail': 'Configuration validated.',
+      'requestId': 'req_1',
+    },
+  },
+  Map<String, dynamic>? text,
+  Map<String, dynamic>? image,
+}) =>
+    {
+      'ok': ok,
+      'kind': kind,
+      'providerId': providerId,
+      'status': status,
+      'detail': detail,
+      'durationMs': 84,
+      'requestId': 'req_1',
+      'readiness': readiness,
+      'text': ?text,
+      'image': ?image,
+      'note': 'Bounded test with fixture data. Nothing was uploaded, stored '
+          'or published to Facebook/Threads.',
     };

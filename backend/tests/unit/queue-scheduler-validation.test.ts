@@ -194,31 +194,63 @@ describe('InMemoryJobQueue', () => {
 /*  Scheduler slots                                                            */
 /* ========================================================================== */
 
-describe('scheduler slots', () => {
+describe('scheduler slots (PART 6 §7: 3–4 posts/day in fixed WIB windows)', () => {
   const config = DEFAULT_SCHEDULER_CONFIG;
 
-  it('produces exactly 24 slots for a 60-minute interval', () => {
+  it('produces exactly 4 slots for the default daily target (four WIB windows)', () => {
     const slots = computeDailySlots('2026-10-12', config);
-    expect(slots).toHaveLength(24);
+    expect(slots).toHaveLength(4);
+    expect(slots.map((slot) => slot.key)).toEqual([
+      '2026-10-12#01',
+      '2026-10-12#02',
+      '2026-10-12#03',
+      '2026-10-12#04',
+    ]);
   });
 
-  it('respects the max-slots cap for shorter intervals', () => {
-    const slots = computeDailySlots('2026-10-12', { ...config, intervalMinutes: 90, maxSlotsPerDay: 12 });
-    // 24*60/90 = 16, capped to 12.
-    expect(slots).toHaveLength(12);
+  it('produces 3 slots when the daily target is 3 (first three windows)', () => {
+    const slots = computeDailySlots('2026-10-12', { ...config, dailyPostTarget: 3 });
+    expect(slots).toHaveLength(3);
+    expect(slots.map((slot) => slot.scheduledFor)).toEqual([
+      '2026-10-12T06:00:00Asia/Jakarta',
+      '2026-10-12T12:00:00Asia/Jakarta',
+      '2026-10-12T16:00:00Asia/Jakarta',
+    ]);
+  });
+
+  it('clamps an out-of-range daily target into 3..4', () => {
+    expect(computeDailySlots('2026-10-12', { ...config, dailyPostTarget: 99 })).toHaveLength(4);
+    expect(computeDailySlots('2026-10-12', { ...config, dailyPostTarget: 1 })).toHaveLength(3);
+  });
+
+  it('ignores the legacy interval/max-slots grid (never schedules outside a window)', () => {
+    const slots = computeDailySlots('2026-10-12', {
+      ...config,
+      intervalMinutes: 10,
+      maxSlotsPerDay: 24,
+      dailyPostTarget: 4,
+    });
+    expect(slots).toHaveLength(4);
+    expect(slots.map((slot) => slot.scheduledFor.slice(11, 16))).toEqual([
+      '06:00',
+      '12:00',
+      '16:00',
+      '19:00',
+    ]);
   });
 
   it('generates stable slot keys', () => {
     const slots = computeDailySlots('2026-10-12', config);
     expect(slots[0]?.key).toBe('2026-10-12#01');
-    expect(slots[23]?.key).toBe('2026-10-12#24');
+    expect(slots[3]?.key).toBe('2026-10-12#04');
   });
 
-  it('spaces slots by the configured interval', () => {
+  it('spaces slots at the fixed window starts', () => {
     const slots = computeDailySlots('2026-10-12', config);
-    expect(slots[0]?.scheduledFor.startsWith('2026-10-12T00:00:00')).toBe(true);
-    expect(slots[1]?.scheduledFor.startsWith('2026-10-12T01:00:00')).toBe(true);
-    expect(slots[23]?.scheduledFor.startsWith('2026-10-12T23:00:00')).toBe(true);
+    expect(slots[0]?.scheduledFor.startsWith('2026-10-12T06:00:00')).toBe(true);
+    expect(slots[1]?.scheduledFor.startsWith('2026-10-12T12:00:00')).toBe(true);
+    expect(slots[2]?.scheduledFor.startsWith('2026-10-12T16:00:00')).toBe(true);
+    expect(slots[3]?.scheduledFor.startsWith('2026-10-12T19:00:00')).toBe(true);
   });
 
   it('rejects a malformed date key', () => {
@@ -241,29 +273,54 @@ describe('scheduler slots', () => {
     expect(utc.toISOString()).toBe('2026-10-11T17:00:00.000Z');
   });
 
-  it('finds the next future slot', () => {
+  it('finds the next future window slot', () => {
     const now = new Date('2026-10-12T03:30:00Z'); // 10:30 Jakarta
     const slot = nextSlot(config, now);
     expect(slot).not.toBeNull();
-    // Next slot after 10:30 Jakarta is 11:00 Jakarta == 04:00 UTC.
-    expect(slot!.scheduledFor).toBe('2026-10-12T04:00:00.000Z');
+    // Next window after 10:30 Jakarta is 12:00 Jakarta == 05:00 UTC.
+    expect(slot!.scheduledFor).toBe('2026-10-12T05:00:00.000Z');
+    expect(slot!.key).toBe('2026-10-12#02');
   });
 
-  it('rolls to the next day after the last slot', () => {
-    const now = new Date('2026-10-12T16:30:00Z'); // 23:30 Jakarta, after slot 24 (23:00)
+  it('rolls to the next day after the last window', () => {
+    const now = new Date('2026-10-12T13:30:00Z'); // 20:30 Jakarta, after the 19:00 window
     const slot = nextSlot(config, now);
-    // Next slot is Oct 13 00:00 Jakarta == Oct 12 17:00 UTC.
-    expect(slot!.scheduledFor).toBe('2026-10-12T17:00:00.000Z');
+    // Next slot is Oct 13 06:00 Jakarta == Oct 12 23:00 UTC.
+    expect(slot!.scheduledFor).toBe('2026-10-12T23:00:00.000Z');
     expect(slot!.key).toBe('2026-10-13#01');
     expect(slot!.date).toBe('2026-10-13');
   });
 
-  it('describes status with the correct slot count', () => {
+  it('describes status with the window list and correct slot count', () => {
     const now = new Date('2026-10-12T00:00:00Z');
     const status = describeSchedulerStatus(config, true, 'mock', now);
-    expect(status.slotsToday).toBe(24);
+    expect(status.slotsToday).toBe(4);
+    expect(status.dailyPostTarget).toBe(4);
+    expect(status.postingWindows).toEqual([
+      '06:00-07:00 WIB',
+      '12:00-13:00 WIB',
+      '16:00-17:00 WIB',
+      '19:00-20:00 WIB',
+    ]);
+    expect(status.todayWindows).toHaveLength(4);
     expect(status.timezone).toBe('Asia/Jakarta');
     expect(status.enabled).toBe(true);
+    expect(status.message).toContain('4 slot(s) today');
+  });
+
+  it('describes a 3-window day when the target is 3', () => {
+    const status = describeSchedulerStatus(
+      { ...config, dailyPostTarget: 3 },
+      true,
+      'mock',
+      new Date('2026-10-12T00:00:00Z'),
+    );
+    expect(status.slotsToday).toBe(3);
+    expect(status.todayWindows.map((window) => window.label)).toEqual([
+      '06:00-07:00 WIB',
+      '12:00-13:00 WIB',
+      '16:00-17:00 WIB',
+    ]);
   });
 });
 

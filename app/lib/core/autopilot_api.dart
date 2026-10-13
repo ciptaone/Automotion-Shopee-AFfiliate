@@ -2,6 +2,7 @@ import 'backend_client.dart';
 import 'app_config.dart';
 import '../models/api_models.dart';
 import '../models/automation_models.dart';
+import '../models/provider_models.dart';
 
 /// Typed facade over the backend's Part 1 + Part 2 endpoint contracts.
 ///
@@ -112,6 +113,85 @@ class AutopilotApi {
   Future<ControlResult> controlAutomation(String action) async =>
       ControlResult.fromJson(
           await client.postAuthed('/v1/automation/control', {'action': action}));
+
+  /* --- PART 6 §2/§3: provider workspace --------------------------------- */
+
+  /// Full provider workspace: providers, independent selection, capabilities.
+  Future<ProviderWorkspacePayload> fetchProviders() async =>
+      ProviderWorkspacePayload.fromJson(
+          await client.getAuthed('/v1/providers'));
+
+  /// Create a provider. [payload] follows the backend's provider input schema.
+  Future<ProviderView> createProvider(Map<String, dynamic> payload) async {
+    final body = await client.postAuthed('/v1/providers', payload);
+    return ProviderView.fromJson(
+        (body['provider'] as Map<String, dynamic>?) ?? const {});
+  }
+
+  /// Update a provider (full re-validation on the backend).
+  Future<ProviderView> updateProvider(
+    String id,
+    Map<String, dynamic> payload,
+  ) async {
+    final body = await client.putAuthed('/v1/providers/$id', payload);
+    return ProviderView.fromJson(
+        (body['provider'] as Map<String, dynamic>?) ?? const {});
+  }
+
+  /// Delete a provider (409 when it is still selected).
+  Future<bool> deleteProvider(String id) async {
+    final body = await client.deleteAuthed('/v1/providers/$id');
+    return body['deleted'] == true;
+  }
+
+  /// Store/replace the credential. The value goes IN and is never read back.
+  Future<ProviderSecretMetadata> saveProviderSecret(String id, String secret) async {
+    final body = await client.putAuthed('/v1/providers/$id/secret', {'secret': secret});
+    return ProviderSecretMetadata.fromJson(
+        (body['secret'] as Map<String, dynamic>?) ?? const {});
+  }
+
+  /// Delete the credential (never returns the value).
+  Future<ProviderSecretMetadata> deleteProviderSecret(String id) async {
+    final body = await client.deleteAuthed('/v1/providers/$id/secret');
+    return ProviderSecretMetadata.fromJson(
+        (body['secret'] as Map<String, dynamic>?) ?? const {});
+  }
+
+  /// Independent text/image selection. Ids may be null (env default).
+  Future<ProviderSelection> saveProviderSelection({
+    String? textProviderId,
+    String? imageProviderId,
+  }) async =>
+      ProviderSelection.fromJson(await client.putAuthed(
+        '/v1/providers/selection',
+        <String, dynamic>{
+          'textProviderId': textProviderId,
+          'imageProviderId': imageProviderId,
+        },
+      ));
+
+  /// Bounded connection test — never generates content, never publishes.
+  Future<ProviderTestResult> testProviderConnection(String id) async =>
+      ProviderTestResult.fromJson(
+          await client.postAuthed('/v1/providers/$id/test/connection', const {}));
+
+  /// Bounded fixture caption test — never publishes.
+  Future<ProviderTestResult> testProviderText(String id) async =>
+      ProviderTestResult.fromJson(
+          await client.postAuthed('/v1/providers/$id/test/text', const {}));
+
+  /// Bounded fixture image test — never publishes.
+  Future<ProviderTestResult> testProviderImage(String id) async =>
+      ProviderTestResult.fromJson(
+          await client.postAuthed('/v1/providers/$id/test/image', const {}));
+
+  /* --- PART 6 §10: usage + budget --------------------------------------- */
+
+  /// Per-request usage ledger + budget status (honest cost classification).
+  Future<UsageSummaryModel> fetchUsageSummary() async =>
+      UsageSummaryModel.fromJson(
+          await client.getAuthed('/v1/usage/summary'));
 }
 
 /// Publishing history payload (fixture-backed until the pipeline exists).

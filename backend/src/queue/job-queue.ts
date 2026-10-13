@@ -15,6 +15,7 @@
  *    second concurrent claim never returns the same job.
  */
 import { randomUUID } from 'node:crypto';
+import { DailyPostLimitError } from '../core/errors.js';
 import type { EnqueueJobInput, JobQueue, JobRecord } from '../contracts/index.js';
 
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
@@ -74,6 +75,15 @@ export class InMemoryJobQueue implements JobQueue {
       if (existing && existing.status === 'succeeded') {
         // Already completed for this key — do not re-run.
         return toRecord(existing);
+      }
+    }
+
+    // PART 6 §7: the daily target is a hard cap, enforced before the row is
+    // created (the PostgreSQL queue does the same check transactionally).
+    if (input.dailyCap) {
+      const used = this.countDay(input.dailyCap.dayPrefix);
+      if (used >= input.dailyCap.max) {
+        throw new DailyPostLimitError(input.dailyCap.dayPrefix.replace(/#$/, ''), input.dailyCap.max);
       }
     }
 
@@ -186,6 +196,21 @@ export class InMemoryJobQueue implements JobQueue {
     let count = 0;
     for (const job of this.jobs.values()) {
       if (job.status === status) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * PART 6 §7: how many logical jobs a day already holds. Every row counts
+   * (including failed ones) — a slot can never be re-created to sneak past
+   * the cap.
+   */
+  countDay(dayPrefix: string): number {
+    let count = 0;
+    for (const job of this.jobs.values()) {
+      if (job.uniqueKey.startsWith(dayPrefix)) {
         count += 1;
       }
     }

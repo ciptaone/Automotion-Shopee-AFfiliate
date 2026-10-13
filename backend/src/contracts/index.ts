@@ -33,6 +33,33 @@ export interface ProviderInfo {
   readonly detail: string;
 }
 
+/**
+ * PART 6 — attribution of a generation result to the provider/model that
+ * ACTUALLY produced it (never an assumed one). `source: 'env_default'` means no
+ * provider was selected and the environment-configured default (mock or an
+ * explicitly unavailable adapter) did the work.
+ *
+ * `usage` carries only what the provider reported; `costKind` distinguishes
+ * actual cost, provider estimate and UNKNOWN — a missing price is never
+ * presented as `$0.00`.
+ */
+export interface GenerationAttribution {
+  readonly providerId: string | null;
+  readonly providerName: string;
+  readonly source: 'configured_provider' | 'env_default';
+  readonly adapterType: string | null;
+  readonly model: string;
+  readonly requestId: string | null;
+  readonly usage: {
+    readonly inputTokens: number | null;
+    readonly outputTokens: number | null;
+    readonly images: number | null;
+    readonly costUsd: number | null;
+    readonly costKind: 'actual' | 'estimated' | 'unknown';
+  } | null;
+  readonly warnings: readonly string[];
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Product feed                                                              */
 /* -------------------------------------------------------------------------- */
@@ -128,6 +155,8 @@ export interface GeneratedImage {
   readonly model: string;
   /** Provider-reported cost estimate in USD, when available. */
   readonly estimatedCostUsd: number | null;
+  /** PART 6: which provider/model produced this image (absent in Part 1–5 mocks). */
+  readonly attribution?: GenerationAttribution;
 }
 
 export interface ImageGenerator {
@@ -193,6 +222,8 @@ export interface GeneratedCaption {
   readonly embeddedUrl: string;
   readonly model: string;
   readonly estimatedCostUsd: number | null;
+  /** PART 6: which provider/model produced this caption (absent in Part 1–5 mocks). */
+  readonly attribution?: GenerationAttribution;
 }
 
 export interface CaptionGenerator {
@@ -349,6 +380,16 @@ export interface EnqueueJobInput {
   readonly scheduledFor: string;
   readonly payload: Readonly<Record<string, unknown>>;
   readonly maxAttempts?: number;
+  /**
+   * PART 6 §7 — transactional daily cap. `dayPrefix` is `uniqueKey` up to and
+   * including "#"; `max` is the configured daily posting target. Enqueueing a
+   * NEW key when the day already holds `max` logical jobs throws
+   * `DailyPostLimitError`; re-enqueueing an existing key stays idempotent.
+   */
+  readonly dailyCap?: {
+    readonly dayPrefix: string;
+    readonly max: number;
+  };
 }
 
 /** Proof of ownership presented on `complete`/`fail` (Part 5). */

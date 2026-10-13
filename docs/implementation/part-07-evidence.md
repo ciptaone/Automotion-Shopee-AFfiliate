@@ -32,10 +32,10 @@ Full discrepancy report in `part-07-audit.md` §1: because no remote existed,
 there was no unrelated remote work to overwrite and no unrelated history to
 merge — adding `origin` is an addition, not a replacement.
 
-`git ls-remote https://github.com/ciptaone/Automotion-Shopee-AFfiliate` fails
-with `Recv failure: Connection was reset` (exit 128) — **outbound HTTPS to
-GitHub is unavailable in this environment**, both before and after adding the
-remote. Therefore:
+`git ls-remote https://github.com/ciptaone/Automotion-Shopee-AFfiliate` failed
+at audit time with `Recv failure: Connection was reset` (exit 128) — the
+GitHub connection from this environment is intermittent (it succeeded later;
+see the push addendum below). At audit time, therefore:
 
 - The PART 7 commit is created locally with the mandated repo-local identity
   (`user.email=ciptaone1@gmail.com`, author **name preserved** as the repo-specified
@@ -55,10 +55,10 @@ with `Recv failure: Connection was reset` during the audit. The GitHub
 connection from this environment is **intermittent**: the actual
 `git push -u origin master` **succeeded** — git exited `0` with
 `* [new branch] master -> master` and set up tracking
-(`branch 'master' set up to track 'origin/master'`). Subsequent independent
-re-reads (`git ls-remote origin`, `git fetch origin`) hit the intermittent
-reset again, so the remote SHA could not be re-verified afterwards; git's own
-push output is the confirmation of record.
+(`branch 'master' set up to track 'origin/master'`). A final read-only
+verification then succeeded as well: `git ls-remote origin` reports
+`refs/heads/master = 149b04a58676b26fc70678c3f9ce49e2f5341608`, identical to
+the local HEAD. Both PART 7 commits (`353e4aa`, `149b04a`) are on GitHub.
 
 ## 2. Provider configuration without API keys — verified pre-existing (no change)
 
@@ -278,13 +278,13 @@ single-match invariant respected by the new UI label.
   histories; discrepancy documented in the audit).
 - **Push succeeded:** `git push -u origin master` exited `0` with
   `* [new branch] master -> master` and set up
-  `master → origin/master` tracking. The connection to GitHub from this
-  environment is intermittent (audit-time probe and post-push `ls-remote` /
-  `fetch` attempts returned `Recv failure: Connection was reset`), so the
-  remote SHA could not be independently re-read afterwards; the push's own git
-  output is the confirmation of record. A follow-up docs-only commit records
-  this corrected outcome (PART 7A, mirroring the PART 6A pattern) and is pushed
-  when connectivity allows.
+  `master → origin/master` tracking; the follow-up PART 7A push was
+  `353e4aa..149b04a  master -> master`. The connection to GitHub from this
+  environment is intermittent (audit-time probe and some post-push attempts
+  returned `Recv failure: Connection was reset`), but a final read-only
+  verification succeeded: `git ls-remote origin` reports
+  `refs/heads/master = 149b04a58676b26fc70678c3f9ce49e2f5341608` — identical
+  to the local HEAD. The full PART 7 history is on GitHub.
 
 ## 10. Honest limits
 

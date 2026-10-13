@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  PART 9A — Android local-device validation.
+
+  The autopilot backend serves plain HTTP on localhost during local-device
+  operation (production still terminates TLS at the nginx proxy, see
+  docs/implementation/part-09-deployment-runbook.md). Android 9+ (targetSdk 28+)
+  blocks ALL cleartext traffic by default — including loopback — so without
+  this config the on-device app could never reach a backend running in Termux
+  on the same phone.
+
+  SCOPE (deliberately minimal, release-safe):
+    * cleartext is permitted ONLY to the loopback host, the Android emulator's
+      alias for the host machine, and localhost;
+    * every other host (the public internet) stays cleartext-BLOCKED by the
+      platform default below.
+
+  To test against a backend on another machine of your LAN, add that host
+  (e.g. <domain includeSubdomains="false">192.168.1.20</domain>) to the
+  domain-config below and rebuild the APK — do NOT widen the base config.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <!-- Same-device backend running in Termux (primary PART 9A topology). -->
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <!-- Android emulator: 10.0.2.2 is the host machine's loopback. -->
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

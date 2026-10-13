@@ -20,7 +20,7 @@
 | 8 | Usage/cost attribution persisted | **PASS (verified in E2E)** | §3 |
 | 9 | Full verification suite | **PASS** | §6 |
 | 10 | Docs (this + audit) | **PASS** | §10 |
-| 11 | PART 7 commit + push attempt | **PASS (commit)** — push **BLOCKED** | §1 |
+| 11 | PART 7 commit + push | **PASS** — commit `353e4aa`, pushed to `origin/master` (see §9 addendum) | §1, §9 |
 
 ---
 
@@ -41,13 +41,24 @@ remote. Therefore:
   (`user.email=ciptaone1@gmail.com`, author **name preserved** as the repo-specified
   `Autopilot Agent`); **no historical commit is amended**.
 - `origin` is configured to the target URL (safe addition — see audit §1).
-- The push is **BLOCKED by network**, not by history: the remote could not be
-  contacted at all. Exact blocker and the next command are reported in the
-  handoff (§9).
+- At audit time the target was unreachable (`Recv failure: Connection was
+  reset`), so the audit flagged the push as a likely BLOCKER; the actual push
+  later succeeded — see the addendum below and §9.
 
 Never used: `git reset --hard`, force-push, history rewrite, `--mirror`,
 `update-ref`. No `.env`, keys, secrets, or runtime data staged (diff reviewed
 file-by-file; §6).
+
+**Push outcome (addendum, corrected after execution):** the earlier draft of
+this section predicted the push would be BLOCKED because `git ls-remote` failed
+with `Recv failure: Connection was reset` during the audit. The GitHub
+connection from this environment is **intermittent**: the actual
+`git push -u origin master` **succeeded** — git exited `0` with
+`* [new branch] master -> master` and set up tracking
+(`branch 'master' set up to track 'origin/master'`). Subsequent independent
+re-reads (`git ls-remote origin`, `git fetch origin`) hit the intermittent
+reset again, so the remote SHA could not be re-verified afterwards; git's own
+push output is the confirmation of record.
 
 ## 2. Provider configuration without API keys — verified pre-existing (no change)
 
@@ -221,7 +232,7 @@ EXIT=2
 | PART 4 live smoke | `part-04-smoke.ps1` vs `127.0.0.1:8794`, `SCHEDULER_ENABLED=true SCHEDULER_MODE=mock AI_IMAGE_PROVIDER=mock AI_TEXT_PROVIDER=mock` | **PASS — 51/51** (`TOTAL=51 PASS=51 FAIL=0`), boot log confirms `content scheduler loop started`; script unchanged |
 | Live provider smoke (no creds) | `npm run smoke:providers` | **PASS (expected BLOCKED)** — exit 2, `RESULT: BLOCKED — NOT_CONFIGURED` |
 | Live provider smoke (real creds) | — | **NOT_TESTED** (no credentials) |
-| GitHub push | `git push -u origin master` | **BLOCKED** — network: `Recv failure: Connection was reset` to github.com (local commit kept) |
+| GitHub push | `git push -u origin master` | **PASS** — exit 0, `* [new branch] master -> master`, tracking set up (connection to GitHub is intermittent; later re-read attempts reset — §1 addendum) |
 
 Diff hygiene: `git status`/`git diff` reviewed file-by-file — 6 modified + 4
 new source/doc files; **no `.env`, keys, secrets, dumps, `backend/data`, or
@@ -259,14 +270,21 @@ single-match invariant respected by the new UI label.
 
 ## 9. Delivery (requirement 11)
 
-- Separate PART 7 commit on `master` (no `PART 8` work included).
+- Separate PART 7 commit `353e4aa` on `master` (no `PART 8` work included;
+  10 files, +1385/−2; author `Autopilot Agent <ciptaone1@gmail.com>`, history
+  untouched).
 - Remote `origin` = `https://github.com/ciptaone/Automotion-Shopee-AFfiliate`
   added (repository had **no** remote before — no overwrite, no unrelated
   histories; discrepancy documented in the audit).
-- **Push BLOCKED by environment network**, not by auth or history:
-  `git ls-remote` / `git push` fail with `Recv failure: Connection was reset`
-  before any negotiation starts. The local commit is preserved and ready; the
-  exact next command is reported in the completion handoff.
+- **Push succeeded:** `git push -u origin master` exited `0` with
+  `* [new branch] master -> master` and set up
+  `master → origin/master` tracking. The connection to GitHub from this
+  environment is intermittent (audit-time probe and post-push `ls-remote` /
+  `fetch` attempts returned `Recv failure: Connection was reset`), so the
+  remote SHA could not be independently re-read afterwards; the push's own git
+  output is the confirmation of record. A follow-up docs-only commit records
+  this corrected outcome (PART 7A, mirroring the PART 6A pattern) and is pushed
+  when connectivity allows.
 
 ## 10. Honest limits
 

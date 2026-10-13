@@ -49,7 +49,7 @@ import { createDatabaseHandle, type DatabaseHandle } from '../db/client.js';
 import { InMemoryJobQueue } from '../queue/job-queue.js';
 import { ShopeeFeedCsvImporter } from '../integrations/feed/shopee-feed-importer.js';
 import { createCaptionGenerator, createImageGenerator } from '../integrations/ai/create-ai.js';
-import { MemoryObjectStorage } from '../integrations/storage/object-storage.js';
+import { createObjectStorage } from '../integrations/storage/object-storage.js';
 import {
   FileProviderStore,
   InMemoryProviderStore,
@@ -235,7 +235,12 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
   };
 
   /* --- Persistence backend (Part 5: explicit, fail-closed) --- */
-  const database = options.overrides?.database ?? createDatabaseHandle(env.DATABASE_URL);
+  const database =
+    options.overrides?.database ??
+    createDatabaseHandle(env.DATABASE_URL, {
+      min: env.DATABASE_POOL_MIN,
+      max: env.DATABASE_POOL_MAX,
+    });
 
   const persistence = resolvePersistenceBackend({
     nodeEnv: env.NODE_ENV,
@@ -310,10 +315,14 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     options.overrides?.schedulerCheckpoints ??
     (postgresDb ? new PostgresSchedulerCheckpointStore(postgresDb) : new InMemorySchedulerCheckpointStore());
 
-  /** PART 5: one queue implementation per backend, same contract. */
+  /** PART 5: one queue implementation per backend, same contract.
+   *  PART 9 §3: the job lease duration is operator-tunable (JOB_LEASE_SECONDS)
+   *  and feeds the PostgreSQL claim/heartbeat window directly. */
   const queue: JobQueue =
     options.overrides?.queue ??
-    (postgresDb ? new PostgresJobQueue({ db: postgresDb }) : new InMemoryJobQueue());
+    (postgresDb
+      ? new PostgresJobQueue({ db: postgresDb, leaseMs: env.JOB_LEASE_SECONDS * 1000 })
+      : new InMemoryJobQueue());
 
   /** Scheduler config as currently configured through the APK settings screen. */
   const currentSchedulerConfig = (): SchedulerConfig => {
@@ -420,9 +429,22 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
   const captionGenerator =
     options.overrides?.captionGenerator ?? generationRouter.forCaption();
 
+  // PART 9 §6: the factory resolves the LIVE S3-compatible adapter when the
+  // credential set is complete (production requires it at env validation), and
+  // the in-memory mock otherwise — development/test keep the free mock, and a
+  // production process can never silently fall back to process-memory assets.
   const storage =
     options.overrides?.storage ??
-    new MemoryObjectStorage({ publicBaseUrl: env.S3_PUBLIC_BASE_URL });
+    createObjectStorage({
+      endpoint: env.S3_ENDPOINT,
+      region: env.S3_REGION,
+      bucket: env.S3_BUCKET,
+      accessKeyId: env.S3_ACCESS_KEY_ID,
+      secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+      forcePathStyle: env.S3_FORCE_PATH_STYLE === 'true',
+      publicBaseUrl: env.S3_PUBLIC_BASE_URL,
+      objectAcl: env.S3_OBJECT_ACL,
+    });
 
   // Part 1: publishers are constructed with a stub transport and allowLive=false,
   // so no live Graph API call can occur regardless of credential presence.

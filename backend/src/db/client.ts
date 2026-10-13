@@ -10,6 +10,8 @@
  * surfaced as degraded health, never as a crash, so the APK can still reach the
  * dashboard to see what is wrong.
  */
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { drizzle, type PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
@@ -21,8 +23,27 @@ import * as schema from './schema.js';
 
 export type Database = PostgresJsDatabase<typeof schema>;
 
-/** Repository migrations folder, resolved relative to this module (src/ or dist/). */
-export const MIGRATIONS_FOLDER = fileURLToPath(new URL('../../drizzle', import.meta.url));
+/**
+ * Repository migrations folder, resolved by walking up from this module until
+ * `drizzle/meta/_journal.json` is found. This works in BOTH layouts the repo
+ * runs from: `src/db/` under tsx (dev) and `dist/src/db/` under plain node
+ * (production), where a naive `../../drizzle` would point inside `dist/`.
+ */
+function resolveMigrationsFolder(): string {
+  let dir = fileURLToPath(new URL('.', import.meta.url));
+  for (let i = 0; i < 6; i += 1) {
+    const candidate = path.join(dir, 'drizzle');
+    if (existsSync(path.join(candidate, 'meta', '_journal.json'))) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  // Last resort (keeps the historic relative path): callers treat an unreadable
+  // folder as "migration status could not be read" and fail closed.
+  return fileURLToPath(new URL('../../drizzle', import.meta.url));
+}
+
+export const MIGRATIONS_FOLDER = resolveMigrationsFolder();
 
 /**
  * Bounded connection pool: a runaway pool is an outage, so the ceiling is
@@ -36,6 +57,12 @@ export const POOL_OPTIONS = {
   max_lifetime: 300,
   prepare: false,
 } as const;
+
+/** PART 9 §3: operator-tunable pool bounds (validated by env.ts). */
+export interface PoolLimits {
+  readonly min?: number;
+  readonly max?: number;
+}
 
 export interface DatabaseHandle {
   readonly db: Database | null;
@@ -68,8 +95,15 @@ export function sanitizeDatabaseError(error: unknown): string {
 }
 
 /** Build a Drizzle client from a postgres.js connection. */
-export function createDatabase(databaseUrl: string): { db: Database; raw: ReturnType<typeof postgres> } {
-  const raw = postgres(databaseUrl, { ...POOL_OPTIONS });
+export function createDatabase(
+  databaseUrl: string,
+  limits?: PoolLimits,
+): { db: Database; raw: ReturnType<typeof postgres> } {
+  const raw = postgres(databaseUrl, {
+    ...POOL_OPTIONS,
+    ...(limits?.min !== undefined ? { min: limits.min } : {}),
+    ...(limits?.max !== undefined ? { max: limits.max } : {}),
+  });
   const db = drizzle(raw, { schema });
   return { db, raw };
 }
@@ -78,7 +112,10 @@ export function createDatabase(databaseUrl: string): { db: Database; raw: Return
  * Create a database handle. Returns a null-handle when no URL is configured.
  * Does NOT connect eagerly — call `healthy()` when a round-trip is needed.
  */
-export function createDatabaseHandle(databaseUrl: string | undefined): DatabaseHandle {
+export function createDatabaseHandle(
+  databaseUrl: string | undefined,
+  limits?: PoolLimits,
+): DatabaseHandle {
   if (!databaseUrl) {
     return {
       db: null,
@@ -103,7 +140,7 @@ export function createDatabaseHandle(databaseUrl: string | undefined): DatabaseH
   let db: Database | null = null;
 
   try {
-    const created = createDatabase(databaseUrl);
+    const created = createDatabase(databaseUrl, limits);
     raw = created.raw;
     db = created.db;
   } catch {

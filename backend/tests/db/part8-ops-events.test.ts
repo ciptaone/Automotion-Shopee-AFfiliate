@@ -372,11 +372,11 @@ describe('PostgresJobQueue.stats', () => {
 /*  Journal consistency for the PART 8 migration (guarded by migrations suite) */
 /* ========================================================================== */
 
-describe('migration journal reaches 0004', () => {
-  it('lists exactly five applied migrations, each with its SHA-256 file hash', async () => {
+describe('migration journal reaches 0005', () => {
+  it('lists exactly six applied migrations, each with its SHA-256 file hash', async () => {
     const rows = await primary.raw`
       select hash, created_at from drizzle.__drizzle_migrations order by id`;
-    expect(rows).toHaveLength(5); // 0000 … 0004_part8_ops_events
+    expect(rows).toHaveLength(6); // 0000 … 0005_part9_ops_delivery_skipped
     for (const row of rows as unknown as Array<{ hash: string; created_at: string }>) {
       expect(row.hash).toMatch(/^[0-9a-f]{64}$/); // sha-256 of the applied .sql file
       expect(Number(row.created_at)).toBeGreaterThan(0);

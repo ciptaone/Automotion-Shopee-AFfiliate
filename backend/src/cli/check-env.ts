@@ -8,9 +8,11 @@
  * Output lists offending KEY NAMES and messages. Secret VALUES are never printed.
  */
 import { loadEnv, describeIntegrationStatus } from '../core/env.js';
+import { loadDotEnv } from '../core/dotenv.js';
 import { EnvironmentError } from '../core/errors.js';
 
 function main(): void {
+  loadDotEnv();
   try {
     const env = loadEnv(process.env);
     console.log('✓ Environment is valid.\n');

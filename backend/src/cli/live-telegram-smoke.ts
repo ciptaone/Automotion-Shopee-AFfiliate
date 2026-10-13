@@ -27,12 +27,14 @@
 import { randomBytes } from 'node:crypto';
 import { buildContainer, type AppContainer } from '../app/container.js';
 import { loadEnv } from '../core/env.js';
+import { loadDotEnv } from '../core/dotenv.js';
 import { createNullLogger } from '../core/logger.js';
 
 const TOKEN_KEY = 'LIVE_SMOKE_TELEGRAM_BOT_TOKEN';
 const CHAT_KEY = 'LIVE_SMOKE_TELEGRAM_CHAT_ID';
 
 async function main(): Promise<void> {
+  loadDotEnv();
   console.log('PART 8 live Telegram smoke — exactly ONE explicit test message.');
   console.log('Nothing is published to Facebook or Threads (no publisher access here).');
 

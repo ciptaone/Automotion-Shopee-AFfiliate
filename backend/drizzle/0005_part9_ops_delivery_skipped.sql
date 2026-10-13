@@ -1,0 +1,2 @@
+ALTER TABLE "ops_events" DROP CONSTRAINT "ops_events_delivery_check";--> statement-breakpoint
+ALTER TABLE "ops_events" ADD CONSTRAINT "ops_events_delivery_check" CHECK (last_delivery_status in ('not_sent', 'deduped', 'cooldown', 'sent', 'failed', 'not_configured', 'skipped'));

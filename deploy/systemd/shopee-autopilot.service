@@ -1,0 +1,80 @@
+# =============================================================================
+# Shopee Affiliate Autopilot — systemd service unit (Part 9 §5/§9)
+#
+# Install (see docs/implementation/part-09-deployment-runbook.md):
+#   1. Install the app under /opt/shopee-autopilot (repo checkout + `npm ci`
+#      && npm run build in backend/), owned by the unprivileged `autopilot`
+#      user, and run `npm run db:migrate` as an EXPLICIT release step.
+#   2. Put the real environment into /etc/shopee-autopilot/env — root-owned,
+#      mode 0600, copied from backend/.env.production.example (placeholders
+#      only in git; NEVER commit a filled-in copy).
+#   3. cp this file /etc/systemd/system/shopee-autopilot.service
+#      && systemctl daemon-reload && systemctl enable --now shopee-autopilot
+#
+# All values below are PLACEHOLDERS. Adjust paths/user to the target host.
+# =============================================================================
+
+[Unit]
+Description=Shopee Affiliate Autopilot (API + scheduler, single process)
+Documentation=file:///opt/shopee-autopilot/docs/implementation/part-09-deployment-runbook.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=autopilot
+Group=autopilot
+WorkingDirectory=/opt/shopee-autopilot/backend
+
+# Root-owned 0600 environment file (placeholders replaced per deployment).
+# Exports NODE_ENV, DATABASE_URL, PUBLIC_URL, S3_*, AUTH_JWT_SECRET, ...
+EnvironmentFile=/etc/shopee-autopilot/env
+Environment=NODE_ENV=production
+
+# Migration NEVER runs at service start — it is the explicit release step
+# `npm run db:migrate` (advisory-locked, refuses drift). The process boots
+# ONLY when PostgreSQL answers and the schema is consistent (exit 78 otherwise),
+# so a bad deploy fails closed instead of serving with a stale schema.
+ExecStart=/usr/bin/node dist/src/main.js
+
+# Crash-loop safety: config/dependency failures (exit 78 = EX_CONFIG) must NOT
+# restart-loop; a real crash is restarted, bounded.
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=78
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# PART 9 §5 — graceful shutdown: SIGTERM, then in-flight scheduler/job work is
+# drained within SHUTDOWN_GRACE_MS (default 20 s) plus a 15 s hard deadline.
+# TimeoutStopSec MUST stay above SHUTDOWN_GRACE_MS + 15 s + margin.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# --- Hardening (§9) ----------------------------------------------------------
+# The app needs no local write access: PostgreSQL and S3 are external; logs go
+# to journald. It listens on 127.0.0.1:8080 behind the HTTPS reverse proxy.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+UMask=0077
+# NOTE: do NOT set MemoryDenyWriteExecute — Node's JIT requires executable memory.
+
+# Bounded resources (defaults; size for 3-4 posts/day workloads).
+MemoryMax=1G
+TasksMax=128
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=shopee-autopilot
+
+[Install]
+WantedBy=multi-user.target

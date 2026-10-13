@@ -20,11 +20,13 @@
  */
 import { buildContainer, type AppContainer } from '../app/container.js';
 import { loadEnv } from '../core/env.js';
+import { loadDotEnv } from '../core/dotenv.js';
 import { createNullLogger } from '../core/logger.js';
 import { POSTING_WINDOWS } from '../scheduler/slots.js';
 import { evaluatePreflight, preflightImageReferenceDeclared } from '../ops/preflight.js';
 
 async function main(): Promise<void> {
+  loadDotEnv();
   console.log('PART 8 preflight — evaluates configuration for intended operation.');
   console.log('Read-only: it cannot enable automation, publishing, or store credentials.');
 

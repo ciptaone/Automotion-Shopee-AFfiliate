@@ -1,10 +1,11 @@
 /**
  * S3-compatible object storage contract + deterministic in-memory mock.
  *
- * Part 1 ships the `ObjectStorage` interface and an in-memory implementation.
- * A live S3 adapter (AWS S3 / Cloudflare R2 / DigitalOcean Spaces / MinIO) is
- * intentionally deferred — those are wire-compatible with the S3 REST API and
- * can be added behind the same interface without touching call sites.
+ * Part 1 shipped the `ObjectStorage` interface and an in-memory implementation;
+ * PART 9 §6 adds the live `S3ObjectStorage` adapter (AWS S3 / Cloudflare R2 /
+ * DigitalOcean Spaces / MinIO — wire-compatible) in `s3-storage.ts`. This
+ * module keeps the shared contract, the free mock, and the factory that picks
+ * between them from validated configuration.
  *
  * The mock records every operation so tests can assert upload success, upload
  * failure, metadata retrieval, accessibility verification, and deletion.
@@ -16,6 +17,7 @@ import type {
   StorageObjectMeta,
   StorageUploadRequest,
 } from '../../contracts/index.js';
+import { S3ObjectStorage, type S3ObjectStorageOptions } from './s3-storage.js';
 
 export interface MemoryObjectStorageOptions {
   readonly publicBaseUrl?: string;
@@ -155,19 +157,40 @@ export interface StorageConfig {
   readonly secretAccessKey?: string;
   readonly forcePathStyle?: boolean;
   readonly publicBaseUrl?: string;
+  /** PART 9 §6: optional object ACL for stores that still support ACLs. */
+  readonly objectAcl?: string;
 }
 
 /**
- * Resolve the storage implementation from validated config.
- * Returns the in-memory mock when S3 credentials are absent, so the rest of the
- * system can run end-to-end without live storage.
+ * Resolve the storage implementation from validated config (Part 9 §6).
+ *
+ *  - Complete S3 credential set  → the LIVE `S3ObjectStorage` adapter
+ *    (SigV4, bounded retries, secret-free errors).
+ *  - No credential set          → the in-memory mock, so development and
+ *    tests stay free and offline.
+ *  - A PARTIAL credential set is impossible: `env.ts` rejects it at startup.
+ *
+ * Production additionally requires the S3 set, so a production process can
+ * never silently fall back to process-memory assets.
  */
-export function createObjectStorage(config: StorageConfig): ObjectStorage {
+export function createObjectStorage(config: StorageConfig, options?: S3ObjectStorageOptions): ObjectStorage {
   const hasS3Creds = Boolean(
     config.endpoint && config.region && config.bucket && config.accessKeyId && config.secretAccessKey,
   );
-  // Part 1: live S3 adapter is not implemented. Even with creds present we use
-  // the mock and surface `ready:false` so /health reports it honestly.
-  void hasS3Creds;
+  if (hasS3Creds) {
+    return new S3ObjectStorage(
+      {
+        endpoint: config.endpoint as string,
+        region: config.region as string,
+        bucket: config.bucket as string,
+        accessKeyId: config.accessKeyId as string,
+        secretAccessKey: config.secretAccessKey as string,
+        forcePathStyle: config.forcePathStyle,
+        publicBaseUrl: config.publicBaseUrl,
+        objectAcl: config.objectAcl,
+      },
+      options,
+    );
+  }
   return new MemoryObjectStorage({ publicBaseUrl: config.publicBaseUrl });
 }

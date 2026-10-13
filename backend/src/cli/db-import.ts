@@ -21,6 +21,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createDatabaseHandle, sanitizeDatabaseError } from '../db/client.js';
+import { loadDotEnv } from '../core/dotenv.js';
 import { PostgresCatalogStore } from '../db/postgres-catalog-store.js';
 import { PostgresSettingsStore } from '../db/postgres-settings-store.js';
 import { PostgresSlotStore } from '../db/postgres-slot-store.js';
@@ -59,6 +60,7 @@ async function readJson<T>(filePath: string): Promise<{ value: T | null; problem
 }
 
 async function main(): Promise<number> {
+  loadDotEnv();
   const { dir, apply } = parseArgs(process.argv.slice(2));
   const url = process.env.DATABASE_URL?.trim();
   if (!url) {

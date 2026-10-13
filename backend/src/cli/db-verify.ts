@@ -24,6 +24,7 @@
  */
 import { getTableConfig } from 'drizzle-orm/pg-core';
 import { createDatabaseHandle, sanitizeDatabaseError } from '../db/client.js';
+import { loadDotEnv } from '../core/dotenv.js';
 import {
   apiClients,
   appSettings,
@@ -245,6 +246,7 @@ export async function verifySchema(query: Query): Promise<Diff[]> {
 }
 
 async function main(): Promise<number> {
+  loadDotEnv();
   const url = process.env.DATABASE_URL?.trim();
   if (!url) {
     console.error(

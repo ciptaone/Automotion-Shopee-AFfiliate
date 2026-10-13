@@ -35,6 +35,7 @@
 import { randomBytes } from 'node:crypto';
 import { buildContainer, type AppContainer } from '../app/container.js';
 import { loadEnv } from '../core/env.js';
+import { loadDotEnv } from '../core/dotenv.js';
 import { createNullLogger } from '../core/logger.js';
 import type { CapabilityStatus, ProviderReadiness } from '../providers/types.js';
 import type { ProviderTestResult } from '../providers/provider-service.js';
@@ -251,6 +252,7 @@ async function runCapability(
 }
 
 async function main(): Promise<void> {
+  loadDotEnv();
   console.log('PART 7 live provider smoke — one bounded TEXT and one bounded IMAGE request.');
   console.log('Nothing is published; temporary providers are deleted afterwards.');
 

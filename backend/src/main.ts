@@ -3,21 +3,30 @@
  *
  * Boot order:
  *   1. Validate + freeze environment (fail fast with key NAMES only).
- *   2. Build the logger (redacting).
+ *   2. Build the logger (redacting) + the PART 9 lifecycle controller.
  *   3. Compose the application container.
- *   4. Build the HTTP server.
- *   5. Start listening; wire graceful shutdown on SIGINT/SIGTERM.
+ *   4. Startup gate: database reachability + schema verification (exit 78 on
+ *      failure) and startup recovery; publish a process_started event.
+ *   5. Build the HTTP server; start listening; wire bounded graceful
+ *      shutdown on SIGINT/SIGTERM (Part 9 §5).
  *
  * Nothing downstream reads process.env directly.
  */
 import { loadEnv } from './core/env.js';
+import { loadDotEnv } from './core/dotenv.js';
 import { EnvironmentError } from './core/errors.js';
 import { createLogger } from './core/logger.js';
 import { buildContainer } from './app/container.js';
 import { buildServer } from './app/server.js';
 import { recoverOnStartup } from './db/recovery.js';
+import { evaluateStartupGate } from './app/startup-gate.js';
+import { LifecycleController } from './app/lifecycle.js';
+import { fingerprintOf, type EventNotifier } from './ops/ops-events.js';
 
 async function main(): Promise<void> {
+  /* --- 0. .env file (real environment variables always win) ------------- */
+  loadDotEnv();
+
   /* --- 1. Environment --- */
   let env;
   try {
@@ -55,6 +64,9 @@ async function main(): Promise<void> {
   /* --- 3. Container --- */
   const container = buildContainer({ env, logger });
 
+  /* --- 3a. Lifecycle controller (Part 9 §5: bounded graceful shutdown) --- */
+  const lifecycle = new LifecycleController({ graceMs: env.SHUTDOWN_GRACE_MS, logger });
+
   /* --- 3b. Automation settings (validated + persisted) --- */
   // Load before serving: init() is idempotent and never fails boot (it falls
   // back to defaults and records a warning that /v1/settings surfaces).
@@ -83,30 +95,57 @@ async function main(): Promise<void> {
     'product catalog loaded',
   );
 
-  /* --- 4. Database readiness + crash recovery (Part 5) --- */
+  /* --- 4. Startup gate (Part 9 §4/§5) + crash recovery (Part 5) ---------- */
   // Fail closed: a database-backed process that cannot reach its database, or
   // whose schema was never migrated, must NOT start and look healthy while
-  // every write goes nowhere. Exit 78 (EX_CONFIG) with a secret-free reason.
-  if (container.persistence.backend === 'postgres') {
-    const problems: string[] = [];
-    if (!(await container.database.healthy())) {
-      problems.push(`database unreachable: ${await container.database.statusDetail()}`);
-    }
-    const migrations = await container.database.migrationStatus();
-    if (!migrations) {
-      problems.push('migration status could not be read from the database.');
-    } else if (!migrations.consistent) {
-      problems.push(`database schema is not up to date: ${migrations.problems.join('; ')}`);
-    }
-    if (problems.length > 0) {
-      logger.fatal(
-        { problems, persistence: container.persistence.backend },
-        'refusing to start: PostgreSQL persistence is required but unusable',
-      );
-      await container.shutdown();
-      process.exit(78); // EX_CONFIG
-    }
+  // every write goes nowhere. Every rule lives in the testable startup gate;
+  // this block only acts on the verdict. Exit 78 (EX_CONFIG), secret-free.
+  const gate = await evaluateStartupGate({
+    env,
+    persistenceBackend: container.persistence.backend,
+    database: container.database,
+  });
 
+  for (const warning of gate.warnings) {
+    logger.warn({ warning }, 'startup warning');
+    // PART 9 §8: dangerous-but-legal production settings are never silent —
+    // they become a persistent, deduplicated ops event (Telegram only when
+    // configured and the severity/event filters allow it).
+    await container.opsMonitor.record({
+      kind: 'production_mock_providers',
+      severity: 'warning',
+      title: 'Production running with mock AI generation defaults',
+      detail: warning,
+      scope: 'startup',
+    });
+  }
+
+  if (!gate.ok) {
+    logger.fatal(
+      { problems: gate.problems, persistence: container.persistence.backend },
+      'refusing to start: startup gate failed',
+    );
+    // PART 9 §8: record first (persistent + deduplicated when the store is
+    // reachable). When the store itself is the broken dependency, fall back to
+    // ONE bounded direct delivery attempt through the same notifier policy —
+    // single attempt, no loop, never throws, so a boot failure can still reach
+    // Telegram while never recursing or stalling the exit path.
+    const outcome = await container.opsMonitor.record({
+      kind: 'startup_failed',
+      severity: 'critical',
+      title: 'Backend refused to start',
+      detail: gate.problems.join('; '),
+      scope: 'startup',
+    });
+    if (outcome.occurrences === 0) {
+      await notifyStartupFailureDirect(container.telegramService, gate.problems, logger);
+    }
+    await container.shutdown();
+    process.exit(78); // EX_CONFIG
+  }
+
+  if (container.persistence.backend === 'postgres') {
+    const migrations = await container.database.migrationStatus();
     const recovery = await recoverOnStartup({
       db: container.database.db,
       queue: container.queue,
@@ -139,8 +178,22 @@ async function main(): Promise<void> {
     }
   }
 
+  // PART 9 §8: restart visibility. This info event persists across boots, so
+  // "when did the process last restart?" is answerable from /v1/ops/health
+  // even after the log is gone. It never notifies (default minSeverity is
+  // warning) and never throws.
+  void container.opsMonitor.record({
+    kind: 'process_started',
+    severity: 'info',
+    title: 'Backend process started',
+    detail:
+      `env=${env.NODE_ENV} persistence=${container.persistence.backend} ` +
+      `scheduler=${env.SCHEDULER_ENABLED === 'true' && env.SCHEDULER_MODE !== 'disabled' ? 'configured' : 'off'}.`,
+    scope: 'boot',
+  });
+
   /* --- 5. Server --- */
-  const app = await buildServer(container);
+  const app = await buildServer(container, { isShuttingDown: () => lifecycle.isStopping() });
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -149,9 +202,48 @@ async function main(): Promise<void> {
     }
     shuttingDown = true;
     logger.info({ signal }, 'shutdown signal received');
+    // PART 9 §5: whatever happens below, the process is gone within
+    // SHUTDOWN_GRACE_MS + 15 s — a service manager must never wait forever.
+    const hardDeadline = setTimeout(() => {
+      logger.fatal({ signal }, 'shutdown hard deadline exceeded — forcing exit(1)');
+      process.exit(1);
+    }, env.SHUTDOWN_GRACE_MS + 15_000);
+    hardDeadline.unref?.();
     try {
+      // (1) flip readiness to 503, (2) stop scheduler/ops loops so no new
+      // ticks or job claims start, (3) drain in-flight work within the grace.
+      const report = await lifecycle.shutdown(signal);
+      if (report.timedOut) {
+        // Persist the warning while the pool is still open. Bounded by 5 s:
+        // a slow notification must never push us past the hard deadline, and
+        // `record` never rejects if the pool closes underneath it.
+        await Promise.race([
+          container.opsMonitor.record({
+            kind: 'shutdown_timeout',
+            severity: 'warning',
+            title: 'Shutdown grace period expired',
+            detail: `${report.abandoned} in-flight task(s) abandoned after ${report.waitedMs}ms; lease recovery requeues them on the next boot.`,
+            scope: 'lifecycle',
+          }),
+          new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, 5_000);
+            t.unref?.();
+          }),
+        ]);
+      }
+      // (4) drain in-flight HTTP, then close database/storage resources.
       await app.close();
       await container.shutdown();
+      clearTimeout(hardDeadline);
+      logger.info(
+        {
+          signal,
+          completed: report.completed,
+          abandoned: report.abandoned,
+          waitedMs: report.waitedMs,
+        },
+        'shutdown complete',
+      );
       process.exit(0);
     } catch (error) {
       logger.error({ err: error }, 'error during shutdown');
@@ -232,9 +324,19 @@ async function main(): Promise<void> {
       }
     };
 
-    schedulerTimer = setInterval(() => void runTick(), TICK_INTERVAL_MS);
+    // PART 9 §5: every tick is tracked so shutdown waits (bounded by
+    // SHUTDOWN_GRACE_MS) for an in-flight tick instead of closing the pool
+    // under it, and no new tick can start once stopping has begun.
+    let tickSequence = 0;
+    const scheduleTick = (): void => {
+      if (lifecycle.isStopping()) return;
+      const work = runTick();
+      lifecycle.track(`scheduler_tick_${++tickSequence}`, work);
+    };
+
+    schedulerTimer = setInterval(() => scheduleTick(), TICK_INTERVAL_MS);
     // First pass shortly after boot so an interrupted slot resumes promptly.
-    setTimeout(() => void runTick(), 2_000);
+    setTimeout(() => scheduleTick(), 2_000);
     logger.info(
       { tickIntervalMs: TICK_INTERVAL_MS, mode: env.SCHEDULER_MODE },
       'content scheduler loop started (scheduler -> queue -> pipeline; no publishing)',
@@ -281,9 +383,18 @@ async function main(): Promise<void> {
     }
   };
 
-  opsTimer = setInterval(() => void runOpsEvaluation(), OPS_EVAL_INTERVAL_MS);
+  // PART 9 §5: the ops pass is tracked exactly like a scheduler tick — shutdown
+  // drains it within the grace period and no new pass starts while stopping.
+  let opsSequence = 0;
+  const scheduleOpsPass = (): void => {
+    if (lifecycle.isStopping()) return;
+    const work = runOpsEvaluation();
+    lifecycle.track(`ops_pass_${++opsSequence}`, work);
+  };
+
+  opsTimer = setInterval(() => scheduleOpsPass(), OPS_EVAL_INTERVAL_MS);
   // First pass shortly after boot (post-recovery, DB verified), then cadence.
-  setTimeout(() => void runOpsEvaluation(), 15_000);
+  setTimeout(() => scheduleOpsPass(), 15_000);
   logger.info(
     { intervalMs: OPS_EVAL_INTERVAL_MS },
     'ops evaluation loop started (health events + notifications)',
@@ -297,11 +408,53 @@ async function main(): Promise<void> {
     }
   };
 
-  // Register the stop hooks on the existing shutdown path.
-  process.prependListener('SIGINT', stopScheduler);
-  process.prependListener('SIGTERM', stopScheduler);
-  process.prependListener('SIGINT', stopOpsEvaluation);
-  process.prependListener('SIGTERM', stopOpsEvaluation);
+  // PART 9 §5: stop callbacks run (in order) inside `lifecycle.shutdown()`,
+  // before the HTTP server closes — replacing the old prepend-listener trick
+  // with one explicit, testable ordering.
+  lifecycle.onStop('content_scheduler_loop', stopScheduler);
+  lifecycle.onStop('ops_evaluation_loop', stopOpsEvaluation);
+}
+
+/**
+ * PART 9 §8 — ONE bounded delivery attempt for a startup failure, used only
+ * when the ops store itself was unreachable (so the durable path never ran).
+ * Single attempt with an 8 s ceiling; it inherits every Telegram policy
+ * (enable flag, severity/event filters, sanitized bounded text) and it can
+ * never recurse, retry in a loop or delay the exit beyond its own timeout.
+ */
+async function notifyStartupFailureDirect(
+  notifier: EventNotifier,
+  problems: readonly string[],
+  logger: ReturnType<typeof createLogger>,
+): Promise<void> {
+  try {
+    const delivery = await Promise.race([
+      notifier.notifyEvent({
+        fingerprint: fingerprintOf('startup_failed', 'direct'),
+        kind: 'startup_failed',
+        severity: 'critical',
+        title: 'Backend refused to start',
+        detail: problems.join('; ').slice(0, 500),
+      }),
+      new Promise<'timeout'>((resolve) => {
+        const timer = setTimeout(() => resolve('timeout'), 8_000);
+        timer.unref?.();
+      }),
+    ]);
+    if (delivery === 'timeout') {
+      logger.warn({}, 'startup failure notification timed out (single attempt)');
+    } else if (!delivery.delivered) {
+      logger.info(
+        { status: delivery.status, errorCode: delivery.errorCode ?? null },
+        'startup failure notification not delivered (single attempt, no retry)',
+      );
+    }
+  } catch (error) {
+    logger.warn(
+      { err: error instanceof Error ? error.message : String(error) },
+      'startup failure notification failed (single attempt, no retry)',
+    );
+  }
 }
 
 void main();

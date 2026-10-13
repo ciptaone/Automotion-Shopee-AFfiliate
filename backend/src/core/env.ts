@@ -84,6 +84,25 @@ export const envSchema = z
     /* --- CORS (explicit allow-list; must not be "*" in production) --- */
     CORS_ORIGINS: corsOrigin,
 
+    /* --- PART 9: production deployment ---------------------------------- */
+    /**
+     * Public origin of this deployment (HTTPS reverse proxy / managed load
+     * balancer) that the APK and operators are pointed at. Required in
+     * production; optional everywhere else. Never contains credentials.
+     */
+    PUBLIC_URL: optionalHttpUrl,
+    /** Bounded PostgreSQL connection-pool limits (postgres.js min/max). */
+    DATABASE_POOL_MIN: z.coerce.number().int().min(0).max(8).default(0),
+    DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(50).default(5),
+    /**
+     * Bounded grace period for in-flight scheduler/job work during SIGTERM/
+     * SIGINT shutdown. The process always exits within this + a fixed 15 s
+     * hard deadline for the remaining close steps.
+     */
+    SHUTDOWN_GRACE_MS: z.coerce.number().int().min(1_000).max(120_000).default(20_000),
+    /** PostgreSQL job-lease duration (crash-recovery window for claims). */
+    JOB_LEASE_SECONDS: z.coerce.number().int().min(30).max(3_600).default(120),
+
     /* --- Database (Part 5: required for postgres/production deployments) --- */
     DATABASE_URL: z.preprocess(
       (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
@@ -147,6 +166,12 @@ export const envSchema = z
     S3_FORCE_PATH_STYLE: z.enum(['true', 'false']).default('false'),
     // Public base URL used by Facebook/Threads to cURL the generated image.
     S3_PUBLIC_BASE_URL: optionalHttpUrl,
+    /**
+     * Optional object ACL sent on public uploads (e.g. `public-read`) for
+     * stores that still support ACLs. Unset = rely on the bucket policy,
+     * which is the documented default (AWS "Block Public Access" buckets).
+     */
+    S3_OBJECT_ACL: optionalTrimmed,
 
     /* --- AI providers (provider-agnostic; both optional in Part 1) --- */
     AI_IMAGE_PROVIDER: z.enum(['mock', 'openai', 'google', 'disabled']).default('mock'),
@@ -199,6 +224,62 @@ export const envSchema = z
           message: 'CORS_ORIGINS must not include "*" in production',
         });
       }
+
+      // PART 9 §3: production-required settings are validated at startup.
+      // Fail closed with key NAMES only — never a value, never a hostname of
+      // a credential. Each rule below stops a specific silent-degradation
+      // failure mode documented in docs/implementation/part-09-audit.md.
+      if (!env.PUBLIC_URL) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['PUBLIC_URL'],
+          message:
+            'PUBLIC_URL is required in production (the public HTTPS origin the APK and reverse proxy use)',
+        });
+      } else if (!env.PUBLIC_URL.startsWith('https://')) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['PUBLIC_URL'],
+          message: 'PUBLIC_URL must use https:// in production',
+        });
+      }
+
+      // Object storage is required so generated/source assets cannot silently
+      // live only in process memory (they must outlive the container).
+      const s3Complete =
+        Boolean(env.S3_ENDPOINT) &&
+        Boolean(env.S3_REGION) &&
+        Boolean(env.S3_BUCKET) &&
+        Boolean(env.S3_ACCESS_KEY_ID) &&
+        Boolean(env.S3_SECRET_ACCESS_KEY);
+      if (!s3Complete) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['S3_ENDPOINT'],
+          message:
+            'S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY are required in production ' +
+            '(durable object storage is mandatory; development keeps the in-memory mock)',
+        });
+      }
+
+      // The shipped example placeholder must never reach production.
+      if (/^CHANGE_ME/i.test(env.AUTH_JWT_SECRET)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['AUTH_JWT_SECRET'],
+          message:
+            'AUTH_JWT_SECRET still holds the .env.example placeholder in production — generate a random secret',
+        });
+      }
+    }
+
+    // Pool bounds are cross-checked in every environment.
+    if (env.DATABASE_POOL_MAX < env.DATABASE_POOL_MIN) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['DATABASE_POOL_MAX'],
+        message: `DATABASE_POOL_MAX (${env.DATABASE_POOL_MAX}) must be >= DATABASE_POOL_MIN (${env.DATABASE_POOL_MIN})`,
+      });
     }
 
     // PART 5: a postgres-backed process (explicitly requested, or production)

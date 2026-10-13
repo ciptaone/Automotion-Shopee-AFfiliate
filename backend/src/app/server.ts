@@ -228,11 +228,26 @@ function claimsOf(request: FastifyRequest): JwtClaims {
 /*  Server factory                                                            */
 /* -------------------------------------------------------------------------- */
 
-export async function buildServer(container: AppContainer): Promise<FastifyInstance> {
+/** PART 9 §5/§8: server-level runtime hooks (readiness during shutdown). */
+export interface BuildServerOptions {
+  /** True once a shutdown signal has begun processing (readiness => 503). */
+  readonly isShuttingDown?: () => boolean;
+}
+
+export async function buildServer(
+  container: AppContainer,
+  options: BuildServerOptions = {},
+): Promise<FastifyInstance> {
   const app = Fastify({
     logger: false, // We use our own redacting logger.
     trustProxy: true,
     bodyLimit: 25 * 1024 * 1024, // allow up to ~25MB feed uploads
+    // PART 9 §9: bounded connection/request lifetimes. Connections that never
+    // send a request are dropped after 15 s; a single request may not exceed
+    // 10 minutes (long enough for a full pipeline run, short enough that a
+    // stuck handler cannot pin a worker forever).
+    connectionTimeout: 15_000,
+    requestTimeout: 600_000,
   });
 
   await app.register(cors, {
@@ -1012,6 +1027,20 @@ export async function buildServer(container: AppContainer): Promise<FastifyInsta
    * inconsistent). Liveness stays on GET /health and never calls a provider.
    */
   app.get('/ready', async (_request, reply) => {
+    // PART 9 §5: readiness flips the moment a shutdown signal begins, so load
+    // balancers stop sending generation work while draining. No database
+    // round-trip is made here — shutdown must stay fast and the verdict does
+    // not depend on it. Liveness stays on GET /health (part: 1, unchanged).
+    if (options.isShuttingDown?.()) {
+      return reply.status(503).send({
+        status: 'stopping',
+        checks: { database: 'not_probed', migrations: 'not_probed' },
+        reason: 'shutting_down',
+        note: 'The process is draining: no new work is accepted. Liveness is reported by GET /health.',
+        timestamp: new Date().toISOString(),
+      });
+    }
+
     const configured = container.database.configured;
     const databaseCheck: 'ok' | 'unavailable' | 'not_configured' = !configured
       ? 'not_configured'

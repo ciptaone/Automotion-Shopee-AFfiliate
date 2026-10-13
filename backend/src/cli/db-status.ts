@@ -18,6 +18,7 @@
  * goes through `sanitizeDatabaseError`.
  */
 import { createDatabaseHandle, sanitizeDatabaseError } from '../db/client.js';
+import { loadDotEnv } from '../core/dotenv.js';
 import type { MigrationEntryStatus } from '../db/migration-status.js';
 
 const MARK: Record<string, string> = {
@@ -34,6 +35,7 @@ function pad(value: string, width: number): string {
 }
 
 async function main(): Promise<number> {
+  loadDotEnv();
   const url = process.env.DATABASE_URL?.trim();
   if (!url) {
     console.error(

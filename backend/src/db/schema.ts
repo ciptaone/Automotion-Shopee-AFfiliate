@@ -445,7 +445,9 @@ export const opsEvents = pgTable(
     check('ops_events_severity_check', sql`severity in ('info', 'warning', 'critical')`),
     check(
       'ops_events_delivery_check',
-      sql`last_delivery_status in ('not_sent', 'deduped', 'cooldown', 'sent', 'failed', 'not_configured')`,
+      // 'skipped' (PART 9): the event was seen but the notifier intentionally
+      // did not deliver (severity/kind filter, notifications disabled).
+      sql`last_delivery_status in ('not_sent', 'deduped', 'cooldown', 'sent', 'failed', 'not_configured', 'skipped')`,
     ),
   ],
 );

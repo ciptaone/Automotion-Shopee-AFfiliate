@@ -124,14 +124,14 @@ Migration safety: `0003_part6_providers.sql` is **additive only** — it creates
 
 ## 4. PART 4 live smoke re-run
 
-`docs/implementation/part-04-smoke.ps1` against a freshly booted backend
-(`127.0.0.1:8794`, empty `backend/data`, `SECRETS_ENCRYPTION_KEY` set):
+Script: `docs/implementation/part-04-smoke.ps1` (unchanged — no assertion was
+weakened or edited).
 
-```
-TOTAL=48  PASS=45  FAIL=3
-```
-
-The 3 failures are **time-of-day dependent, not regressions**:
+**First run — 45/48, caused by a harness mistake, not a code bug.** The smoke
+backend was started WITHOUT `SCHEDULER_ENABLED=true`, so the
+scheduler→queue→pipeline timer loop never started (`env.ts` defaults
+`SCHEDULER_ENABLED` to `'false'`; `main.ts` only creates the loop when it is
+`'true'`). All three failures follow from that single omission:
 
 ```
 [FAIL] scheduler enqueued a job into the queue :: waited=00:02:00 count=0
@@ -139,20 +139,40 @@ The 3 failures are **time-of-day dependent, not regressions**:
 [FAIL] contentScheduler.lastTick recorded     :: still null
 ```
 
-The smoke script waits 2 minutes for the scheduler to enqueue a job — an
-assumption that held under the PART 4 hourly cadence (a slot always came due
-within 60 minutes). Under the PART 6 windowed schedule the run started at
-~07:15 WIB when the next window (12:00–13:00 WIB) was ~5 hours away, so no job
-was due inside the 2-minute observation window. The scheduler itself was
-healthy in the same responses: `slotsToday=4`, `next=2026-10-13#02` (the second
-WIB window), `maxCatchUpPerTick=1`, and the manual `tick` reported
-`skipped=0` with no published platform — i.e. correct anti-catch-up, no burst,
-publishing still disabled. All 45 other checks (PART 1 health key, token,
-editorial `#ai #automation` ending, disclosure, honest `automatedFidelityScore:
-null`, `notAssessed` list, mock/live attribution, verbatim affiliate URL,
-file-persisted slot, no non-fixture publication records, integrations disabled)
-PASS unchanged. The smoke script itself was **not modified** — no assertion was
-weakened.
+Why one omission explains all three: `ContentScheduler.tick()` records
+`lastTick` on EVERY tick — including "Automation is paused" and "No due slots".
+A `null` `lastTick` is therefore only possible when ZERO ticks ever ran, which a
+disabled loop guarantees. No ticks ⇒ nothing enqueued ⇒ no `content_slot` job.
+(The earlier draft of this document attributed these to "time-of-day"; that
+diagnosis was wrong and is corrected here by PART 6A.)
+
+**Re-run with the documented PART 4 environment — 51/51 PASS.** Restarted with
+`SCHEDULER_ENABLED=true`, `SCHEDULER_MODE=mock`, `AI_IMAGE_PROVIDER=mock`,
+`AI_TEXT_PROVIDER=mock` (`part-04-evidence.md` §4 recipe); the boot log
+confirmed `content scheduler loop started`:
+
+```
+[PASS] scheduler enqueued a job into the queue :: waited=00:00:05.57 count=1
+[PASS] queued job kind=content_slot            :: count=1
+[PASS] contentScheduler.lastTick recorded      :: enqueued= executed=0 skipped=1
+TOTAL=51 PASS=51 FAIL=0
+```
+
+**51/51 exactly matches the PART 4 baseline.** The run also demonstrates the
+intended PART 6 schedule live: at 08:23 WIB the 06:00–07:00 window was already
+past and the 12:00–13:00 window not yet open, so exactly ONE slot was due. It was
+enqueued and executed once, and the following tick correctly SKIPPED it as
+already terminal (`publish_ready`) instead of re-running it — `skipped=1`,
+`msg="Tick complete: 0 enqueued, nothing to execute."`. `/v1/scheduler/status`
+confirmed `dailyPostTarget=4`, `slotsToday=4`, the four WIB windows, and
+`nextSlot.key=2026-10-13#02` (slots are sequential, one per window — not 24
+hourly), with `publishing=disabled` and `maxCatchUpPerTick=1`.
+
+All 45 checks that passed in the first run (PART 1 health key, token, editorial
+`#ai #automation` ending, disclosure, honest `automatedFidelityScore: null`,
+`notAssessed` list, mock/live attribution, verbatim affiliate URL, file-persisted
+slot, no non-fixture publication records, integrations disabled) pass in the
+51/51 run as well.
 
 ## 5. Flutter — analyze / test / debug APK
 
@@ -224,19 +244,29 @@ New test files:
 
 ## 7. Deviations (honest disclosure)
 
-1. **`PROVIDER_HTTP_TIMEOUT_MS` env var was NOT added.** The audit proposed a
-   global HTTP-timeout override; the implementation instead uses the
-   per-provider `timeoutMs` (validated, clamped 1–120 s by the transport). This
-   keeps one source of truth and avoids a second, conflicting knob. Global
-   behaviour is still bounded.
+1. **`PROVIDER_HTTP_TIMEOUT_MS` env var was NOT added** (re-confirmed by the
+   PART 6A audit). The effective timeout is double-bounded per provider: the
+   config schema validates `timeoutMs` as an int in `[1_000, 120_000]` ms
+   (default 30 000) and `maxRetries` in `[0, 3]` (default 2) on save, and the
+   transport re-clamps it to `[1 s, 120 s]` at request time with an
+   `AbortController` timer (`Math.min(Math.max(timeoutMs, 1_000), 120_000)`),
+   alongside `redirect: 'error'`, a streamed response-size cap (8 MB, with a
+   `content-length` pre-check) and JSON content-type discipline. All 7 provider
+   HTTP call sites go through `transport.request`; the only raw `fetch` is the
+   transport's own default. A global override would be a second, conflicting
+   source of truth that bypasses the per-provider validation and the SSRF
+   re-check, so it was deliberately not added.
 2. **Live provider smoke is NOT_TESTED.** No OpenAI-compatible/Ollama endpoint
    credentials or budget exist in this environment, so the opt-in live smoke
    (real text/image generation against a configured provider) was not run.
    Everything else — endpoint policy, transport, adapters, readiness, usage —
    is covered by injected-fetch unit/contract/DB tests that never touch the
    network.
-3. **PART 4 smoke: 45/48.** The 3 failures are the time-of-day scheduling
-   observation described in §4 (script unmodified, assertions unweakened).
+3. **PART 4 smoke: 51/51 PASS** (corrected by PART 6A). An intermediate run
+   showed 45/48, but the cause was a harness mistake — the smoke backend was
+   started without `SCHEDULER_ENABLED=true`, so the scheduler loop never ran.
+   With the documented environment the unchanged script passes 51/51, matching
+   the PART 4 baseline. See §4.
 
 ## 8. Safety invariants re-verified
 
@@ -287,7 +317,25 @@ Script fix: `backend/scripts/db.ps1` — `New-LocalUser` description shortened t
 
 ---
 
-**Overall:** PASS, with the three documented deviations/limitations in §7
-(one unimplemented env knob, live provider smoke untestable here, 3
-time-of-day-dependent smoke observations). No PART 1–5 behaviour was regressed;
-no assertion was weakened; publishing stays disabled.
+## 11. PART 6A audit addendum
+
+The PART 6A scheduling/configuration audit re-verified this evidence and
+corrected one misdiagnosis:
+
+- **Smoke now 51/51.** The three 45/48 failures were a single harness mistake
+  (the smoke server was started without `SCHEDULER_ENABLED=true`, so the
+  scheduler loop never ran), not time-of-day and not a code bug. §4 and §7.3
+  above are corrected.
+- **Timeout enforcement re-confirmed sufficient** (§7.1): per-provider
+  `timeoutMs` is double-bounded (schema `[1 s, 120 s]` on save + transport
+  re-clamp at request time), so no `PROVIDER_HTTP_TIMEOUT_MS` was added.
+- **Regression suites re-run clean:** focused unit 151/151, full backend
+  730/730, PostgreSQL 76/76 (`db:status`/`db:verify` clean), original smoke
+  51/51. Readiness still tracks text and image capabilities independently;
+  live generation remains NOT_TESTED. No code changed; PART 7 not started.
+
+---
+
+**Overall:** PASS, with the documented limitations in §7 (one deliberately
+unimplemented env knob, live provider smoke untestable here). No PART 1–5
+behaviour was regressed; no assertion was weakened; publishing stays disabled.

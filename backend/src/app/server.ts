@@ -764,6 +764,9 @@ export async function buildServer(container: AppContainer): Promise<FastifyInsta
         captions: record.captions.length,
         validationPassed: record.validationPassed,
         blockers: record.blockers,
+        // PART 7: why a slot stopped (`failed` slots carry an explicit,
+        // redacted reason; `blocked` slots use `blockers` instead).
+        lastError: record.lastError ?? null,
         attempts: record.attempts,
         publishReady: record.stage === 'publish_ready',
         updatedAt: record.updatedAt,

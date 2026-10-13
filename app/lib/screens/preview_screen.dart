@@ -228,6 +228,23 @@ class _PreviewScreenState extends State<PreviewScreen> {
               color: scheme.error,
             ),
         ],
+        // PART 7: a failed slot must state WHY (missing key, unsupported
+        // capability, upstream error…) instead of a bare "failed" banner.
+        if (preview.lastError != null &&
+            preview.lastError!.trim().isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Text('Reason generation stopped:',
+              style: Theme.of(context)
+                  .textTheme
+                  .titleSmall
+                  ?.copyWith(fontWeight: FontWeight.w600)),
+          const SizedBox(height: 4),
+          _IssueLine(
+            rule: 'generation_stopped',
+            message: preview.lastError!.trim(),
+            color: scheme.error,
+          ),
+        ],
         const SizedBox(height: 4),
         Text(
           preview.note.isEmpty

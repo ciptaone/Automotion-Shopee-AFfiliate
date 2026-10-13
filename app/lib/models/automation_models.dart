@@ -678,6 +678,7 @@ class ContentPreview {
     this.stage,
     this.images = const [],
     this.blockers = const [],
+    this.lastError,
     this.providers,
     this.publishReady = false,
     this.attempts = 0,
@@ -711,6 +712,11 @@ class ContentPreview {
 
   /// Machine-readable reasons the slot is blocked (empty when publish-ready).
   final List<PipelineBlocker> blockers;
+
+  /// PART 7: exact reason generation stopped on a `failed` slot (redacted).
+  /// Null on fixtures and on healthy slots — never a bare "failed" with no
+  /// explanation (e.g. a missing API key is spelled out here).
+  final String? lastError;
 
   /// Honest provider summary (null for fixtures).
   final PipelineProviders? providers;
@@ -773,6 +779,7 @@ class ContentPreview {
               .map(PipelineBlocker.fromJson)
               .toList() ??
           const [],
+      lastError: json['lastError'] as String?,
       providers: json['providers'] is Map<String, dynamic>
           ? PipelineProviders.fromJson(json['providers'] as Map<String, dynamic>)
           : null,

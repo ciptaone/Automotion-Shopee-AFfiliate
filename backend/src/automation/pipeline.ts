@@ -729,7 +729,17 @@ export class ContentPipeline {
   /* ---------------------------------------------------------------------- */
 
   private async bumpAttempt(record: SlotContentRecord): Promise<SlotContentRecord> {
-    const next = { ...record, attempts: record.attempts + 1, updatedAt: this.now().toISOString() };
+    const next: SlotContentRecord = {
+      ...record,
+      attempts: record.attempts + 1,
+      // PART 7: a new attempt starts WITHOUT the previous attempt's failure
+      // reason — otherwise a slot that recovers (e.g. the operator added the
+      // missing API key) would keep showing a stale error on healthy content.
+      // A failure in THIS attempt re-sets it; `blocked` reasons live in
+      // `blockers` instead.
+      lastError: null,
+      updatedAt: this.now().toISOString(),
+    };
     await this.deps.slots.put(next);
     return next;
   }

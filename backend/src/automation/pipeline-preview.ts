@@ -127,6 +127,14 @@ export interface PipelinePreview {
     };
   };
   readonly blockers: ReadonlyArray<{ code: string; message: string }>;
+  /**
+   * PART 7: the exact reason generation stopped, when the slot is `failed`
+   * (missing credential, unsupported capability, upstream error …). Redacted
+   * before it is persisted, so it is safe to expose. `blocked` slots carry
+   * their reasons in `blockers` instead. Null while everything is healthy —
+   * the dashboard must never show a bare "failed" with no explanation.
+   */
+  readonly lastError: string | null;
   readonly publishReady: boolean;
   readonly attempts: number;
   readonly generationRunId: string;
@@ -327,6 +335,7 @@ export function buildPipelinePreview(input: BuildPipelinePreviewInput): Pipeline
       },
     },
     blockers: record.blockers.map((blocker) => ({ code: blocker.code, message: blocker.message })),
+    lastError: record.lastError ?? null,
     publishReady: record.stage === 'publish_ready',
     attempts: record.attempts,
     generationRunId: record.generationRunId,

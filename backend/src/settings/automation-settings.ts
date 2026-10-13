@@ -63,6 +63,10 @@ export interface AutomationSettings {
   readonly threadsEnabled: boolean;
   readonly imageCountPolicy: ImageCountPolicy;
   readonly telegramNotificationsEnabled: boolean;
+  /** PART 8 §6 — minimum severity that may reach Telegram (default: warning). */
+  readonly notificationMinSeverity: 'info' | 'warning' | 'critical';
+  /** PART 8 §6 — event-kind allow-list; empty means "no kind filter (all)". */
+  readonly notificationEventKinds: readonly string[];
   readonly automationState: AutomationState;
   /** Product selection mode (Part 3). Default: auto across all eligible categories. */
   readonly selectionMode: SelectionMode;
@@ -86,6 +90,9 @@ export const DEFAULT_AUTOMATION_SETTINGS: AutomationSettings = {
   threadsEnabled: true,
   imageCountPolicy: 'random_1_or_2',
   telegramNotificationsEnabled: true,
+  // PART 8 §6: only warning+ events reach Telegram by default; no kind filter.
+  notificationMinSeverity: 'warning',
+  notificationEventKinds: [],
   // Honest default: nothing publishes until an operator explicitly starts it.
   automationState: 'paused',
   // Locked decision (Part 3): products are selected across ALL eligible
@@ -132,6 +139,13 @@ const settingsObjectSchema = z.object({
   threadsEnabled: z.boolean(),
   imageCountPolicy: z.enum(IMAGE_COUNT_POLICIES),
   telegramNotificationsEnabled: z.boolean(),
+  // PART 8 §6: severity floor + optional kind allow-list (defaults keep
+  // pre-Part-8 persisted settings loadable; empty list = no kind filter).
+  notificationMinSeverity: z.enum(['info', 'warning', 'critical']).default('warning'),
+  notificationEventKinds: z
+    .array(z.string().trim().min(1).max(40))
+    .max(30, 'too many notification event kinds')
+    .default([]),
   automationState: z.enum(AUTOMATION_STATES),
   // Defaults keep pre-Part-3 persisted settings files loadable.
   selectionMode: z.enum(SELECTION_MODES).default('auto'),

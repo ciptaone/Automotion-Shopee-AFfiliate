@@ -408,6 +408,26 @@ export interface LeaseRecoverySummary {
 }
 
 /**
+ * PART 8 4: safe queue observability — low-cardinality counts and ages only.
+ * No job ids, product data or keys; suitable for metric labels and dashboards.
+ */
+export interface QueueStats {
+  readonly pending: number;
+  readonly running: number;
+  readonly succeeded: number;
+  readonly failed: number;
+  readonly cancelled: number;
+  /** Pending rows that already consumed >=1 attempt (rescheduled failures). */
+  readonly retrying: number;
+  /** Oldest pending job's scheduled_for (ISO) — null when the queue is empty. */
+  readonly oldestPendingAt: string | null;
+  /** Age of that oldest pending job in ms — null when the queue is empty. */
+  readonly oldestPendingAgeMs: number | null;
+  /** Running jobs whose lease already expired (crash candidates). Always 0 in-memory (no leases). */
+  readonly expiredLeases: number;
+}
+
+/**
  * Durable job queue contract. The Postgres-backed implementation is used in
  * production; an in-memory implementation satisfies tests and DB-less dev.
  *
@@ -442,6 +462,12 @@ export interface JobQueue {
    * longer than its initial lease. Returns false when ownership was lost.
    */
   extendLease?(jobId: string, claimToken: string, leaseMs?: number): Promise<boolean>;
+  /**
+   * PART 8 4: optional observability snapshot — counts by status, oldest
+   * pending age, expired leases. Implemented by both queues; when absent the
+   * ops layer reports queue metrics as unavailable rather than guessing.
+   */
+  stats?(): Promise<QueueStats>;
 }
 
 /**

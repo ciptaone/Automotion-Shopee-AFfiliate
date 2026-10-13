@@ -38,8 +38,8 @@ describe('migrations — the committed chain applies to a fresh database', () =>
   it('reports every journal entry as applied, with no drift', async () => {
     const status = await loadMigrationStatus(MIGRATIONS_FOLDER, query);
     expect(status.tablePresent).toBe(true);
-    expect(status.journalEntries).toBe(4);
-    expect(status.appliedRows).toBe(4);
+    expect(status.journalEntries).toBe(5);
+    expect(status.appliedRows).toBe(5);
     expect(status.pendingCount).toBe(0);
     expect(status.divergedCount).toBe(0);
     expect(status.unknownApplied).toHaveLength(0);
@@ -49,6 +49,7 @@ describe('migrations — the committed chain applies to a fresh database', () =>
       '0001_part3_catalog',
       '0002_part5_persistence',
       '0003_part6_providers',
+      '0004_part8_ops_events',
     ]);
   });
 
@@ -64,6 +65,7 @@ describe('migrations — the committed chain applies to a fresh database', () =>
       'import_batches',
       'jobs',
       'notifications',
+      'ops_events',
       'products',
       'provider_secrets',
       'provider_workspaces',

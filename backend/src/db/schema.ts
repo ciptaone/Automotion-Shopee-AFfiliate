@@ -403,3 +403,49 @@ export const generationUsage = pgTable(
     check('generation_usage_cost_kind_check', sql`cost_kind in ('actual', 'estimated', 'unknown')`),
   ],
 );
+
+/* -------------------------------------------------------------------------- */
+/*  PART 8 - durable operational events + alert deduplication                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One row per alert FINGERPRINT (not per occurrence): repeat occurrences bump
+ * `occurrences`/`last_seen_at` instead of inserting a second row, which is what
+ * makes cooldown-based deduplication concurrency-safe (`ON CONFLICT DO UPDATE`).
+ *
+ * Stores operational metadata only - sanitized titles, error CODES and bounded
+ * detail text. Never stores secrets, tokens, prompts, product data or raw
+ * provider responses. `last_delivery_status` reflects what the transport
+ * actually reported; a failed or unsent notification is never recorded as sent.
+ */
+export const opsEvents = pgTable(
+  'ops_events',
+  {
+    id: uuid('id').primaryKey(),
+    /** Stable alert identity, e.g. `scheduler_tick_failed:production`. */
+    fingerprint: varchar('fingerprint', { length: 255 }).notNull(),
+    kind: varchar('kind', { length: 40 }).notNull(),
+    severity: varchar('severity', { length: 20 }).notNull(),
+    title: text('title').notNull(),
+    /** Bounded, sanitized context (error codes, counts) - never raw payloads. */
+    detail: text('detail'),
+    occurrences: integer('occurrences').notNull().default(1),
+    firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    /** No notification is sent again before this instant (cooldown window). */
+    cooldownUntil: timestamp('cooldown_until', { withTimezone: true }),
+    lastDeliveryStatus: varchar('last_delivery_status', { length: 20 }).notNull().default('not_sent'),
+    lastErrorCode: varchar('last_error_code', { length: 60 }),
+    lastMessageId: varchar('last_message_id', { length: 64 }),
+    lastNotifiedAt: timestamp('last_notified_at', { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex('ops_events_fingerprint_idx').on(t.fingerprint),
+    index('ops_events_last_seen_idx').on(t.lastSeenAt),
+    check('ops_events_severity_check', sql`severity in ('info', 'warning', 'critical')`),
+    check(
+      'ops_events_delivery_check',
+      sql`last_delivery_status in ('not_sent', 'deduped', 'cooldown', 'sent', 'failed', 'not_configured')`,
+    ),
+  ],
+);

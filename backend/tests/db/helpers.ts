@@ -52,7 +52,7 @@ export async function resetDatabase(db: Database): Promise<void> {
     truncate table
       jobs, slot_contents, publish_runs, products, import_batches,
       app_settings, scheduler_checkpoints, notifications, api_clients,
-      provider_workspaces, provider_secrets, generation_usage
+      provider_workspaces, provider_secrets, generation_usage, ops_events
     restart identity cascade`);
 }
 

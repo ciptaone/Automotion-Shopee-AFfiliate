@@ -92,6 +92,20 @@ export interface ContentSchedulerDeps {
   readonly checkpoints?: SchedulerCheckpointStore;
   /** PART 5: cross-process tick lock (advisory lock in PostgreSQL). */
   readonly tickLock?: SchedulerTickLock;
+  /**
+   * PART 8 §6: records the terminal failure event (retries exhausted).
+   * Structurally typed on purpose so this module does not depend on the ops
+   * package; optional, so existing tests and wiring stay untouched.
+   */
+  readonly opsMonitor?: {
+    record(event: {
+      kind: string;
+      severity: 'info' | 'warning' | 'critical';
+      title: string;
+      detail?: string;
+      scope?: string;
+    }): Promise<unknown>;
+  };
 }
 
 export interface SlotOutcome {
@@ -296,7 +310,24 @@ export class ContentScheduler {
     claimToken: string | null,
   ): Promise<void> {
     try {
-      await this.deps.queue.fail(jobId, message, retryable, { claimToken });
+      const record = await this.deps.queue.fail(jobId, message, retryable, { claimToken });
+      // PART 8 §6: `failed` is the terminal state — the attempt budget is spent
+      // (or the failure was non-retryable). Record a durable event and attempt
+      // a (deduplicated, cooldown-limited) notification. `record()` never
+      // throws, so this cannot affect queue bookkeeping.
+      if (record.status === 'failed' && this.deps.opsMonitor) {
+        void this.deps.opsMonitor
+          .record({
+            kind: 'generation_job_failed',
+            severity: 'critical',
+            title: `Generation job failed permanently (${record.kind})`,
+            detail: `Job ${record.uniqueKey} reached its terminal state after ${record.attempts}/${record.maxAttempts} attempt(s): ${record.lastError ?? 'unknown error'}`,
+            // Per-slot fingerprint: each slot notifies once per cooldown; the
+            // scope is the slot key (no product data, bounded cardinality).
+            scope: record.uniqueKey,
+          })
+          .catch(() => undefined);
+      }
     } catch (error) {
       this.deps.logger?.warn(
         { jobId, err: error instanceof Error ? error.message : String(error) },

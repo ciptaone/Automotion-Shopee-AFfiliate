@@ -2,6 +2,7 @@ import 'backend_client.dart';
 import 'app_config.dart';
 import '../models/api_models.dart';
 import '../models/automation_models.dart';
+import '../models/ops_models.dart';
 import '../models/provider_models.dart';
 
 /// Typed facade over the backend's Part 1 + Part 2 endpoint contracts.
@@ -192,6 +193,14 @@ class AutopilotApi {
   Future<UsageSummaryModel> fetchUsageSummary() async =>
       UsageSummaryModel.fromJson(
           await client.getAuthed('/v1/usage/summary'));
+
+  /* --- PART 8: operational health ---------------------------------------- */
+
+  /// Full component health: database, migrations, scheduler, queue, providers,
+  /// storage, Telegram, budget and the publishing gate. Read-only; the backend
+  /// answers from cached probes — no AI call is ever made for this request.
+  Future<OpsHealthReport> fetchOpsHealth() async =>
+      OpsHealthReport.fromJson(await client.getAuthed('/v1/ops/health'));
 }
 
 /// Publishing history payload (fixture-backed until the pipeline exists).

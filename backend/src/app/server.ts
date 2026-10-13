@@ -23,6 +23,25 @@
  *  - POST   /v1/pipeline/run         Authenticated (control). Generate content for a slot.
  *  - GET    /v1/pipeline/slots       Authenticated. List pipeline slot records.
  *
+ * PART 8 (operational readiness & notifications):
+ *  - GET    /ready                   Public. Readiness gate (200/503): PostgreSQL
+ *                                    reachability + schema consistency only; no leaks.
+ *  - GET    /v1/ops/health           Authenticated. Component health (cached provider
+ *                                    probes only — never a paid API call) + diagnostics.
+ *  - GET    /v1/ops/metrics          Authenticated. Low-cardinality scheduler/queue/
+ *                                    generation counters and ages.
+ *  - GET    /v1/ops/preflight        Authenticated (control). Blockers + warnings for
+ *                                    intended operation (read-only; enables nothing).
+ *  - GET    /v1/notifications/telegram        Authenticated. Notification settings +
+ *                                    credential PRESENCE (values never returned).
+ *  - PUT    /v1/notifications/telegram        Authenticated (control). Enable/disable,
+ *                                    severity floor, event-kind filter.
+ *  - PUT    /v1/notifications/telegram/secret Authenticated (control). Store the bot
+ *                                    token + chat id (write-only, AES-256-GCM).
+ *  - DELETE /v1/notifications/telegram/secret Authenticated (control). Remove them.
+ *  - POST   /v1/notifications/telegram/test   Authenticated (control). Explicit,
+ *                                    rate-limited test send; reports confirmed delivery only.
+ *
  * PART 6 (custom AI providers + usage):
  *  - GET    /v1/providers            Authenticated. Providers + capabilities + readiness
  *                                    + masked secret metadata (never a credential).
@@ -57,6 +76,12 @@ import { AppError, AuthenticationError, ShopeeFeedError } from '../core/errors.j
 import { redactDeep } from '../core/redact.js';
 import { InMemoryJobQueue } from '../queue/job-queue.js';
 import { CONTENT_JOB_KIND } from '../scheduler/content-scheduler.js';
+import { POSTING_WINDOWS } from '../scheduler/slots.js';
+import {
+  TELEGRAM_SECRET_BOT_TOKEN,
+  TELEGRAM_SECRET_CHAT_ID,
+} from '../ops/ops-service.js';
+import { evaluatePreflight, preflightImageReferenceDeclared } from '../ops/preflight.js';
 import { withIntegrationHealth } from './integration-health.js';
 import { describeAutomationStatus } from '../automation/status.js';
 import {
@@ -96,6 +121,9 @@ const settingsPatchSchema = z
     threadsEnabled: z.boolean().optional(),
     imageCountPolicy: z.enum(IMAGE_COUNT_POLICIES).optional(),
     telegramNotificationsEnabled: z.boolean().optional(),
+    /** PART 8 §6: severity floor + optional event-kind allow-list. */
+    notificationMinSeverity: z.enum(['info', 'warning', 'critical']).optional(),
+    notificationEventKinds: z.array(z.string().trim().min(1).max(40)).max(30).optional(),
     selectionMode: z.enum(SELECTION_MODES).optional(),
     selectedCategoryIds: z.array(z.string().trim().min(1).max(64)).max(100).optional(),
     /** PART 6 §7: 3 or 4 posts per Asia/Jakarta day (the four WIB windows). */
@@ -107,6 +135,33 @@ const settingsPatchSchema = z
   .strict();
 
 const controlRequestSchema = z.object({ action: z.enum(AUTOMATION_ACTIONS) }).strict();
+
+/** PART 8 §6: notification settings (non-sensitive fields only — no credentials). */
+const notificationSettingsSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    minSeverity: z.enum(['info', 'warning', 'critical']).optional(),
+    eventKinds: z.array(z.string().trim().min(1).max(40)).max(30).optional(),
+  })
+  .strict();
+
+/** PART 8 §6: Telegram credential write (write-only; the values are never echoed). */
+const telegramSecretSchema = z
+  .object({
+    botToken: z
+      .string()
+      .trim()
+      .min(20)
+      .max(200)
+      .refine((value) => !/\s/.test(value), 'bot token must not contain whitespace'),
+    chatId: z
+      .string()
+      .trim()
+      .min(1)
+      .max(64)
+      .refine((value) => !/\s/.test(value), 'chat id must not contain whitespace'),
+  })
+  .strict();
 
 /** Feed import: raw file bytes as base64 (multipart upload is a later part). */
 const catalogImportSchema = z
@@ -942,6 +997,286 @@ export async function buildServer(container: AppContainer): Promise<FastifyInsta
       budget: summary.budget,
       recent: summary.recent,
       note: 'Cost figures are provider-reported. Requests with no reported cost are counted as "unknown cost".',
+    });
+  });
+
+  /* ---------------------------------------------------------------------- */
+  /*  PART 8 §3: readiness + operations diagnostics                          */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Public readiness gate for load balancers/probes. Deliberately minimal:
+   * status codes only — no hostnames, credentials, provider bodies or internal
+   * network detail. 200 = dependencies permit normal operation; 503 = the
+   * service must NOT be sent generation work (database unreachable or schema
+   * inconsistent). Liveness stays on GET /health and never calls a provider.
+   */
+  app.get('/ready', async (_request, reply) => {
+    const configured = container.database.configured;
+    const databaseCheck: 'ok' | 'unavailable' | 'not_configured' = !configured
+      ? 'not_configured'
+      : (await container.database.healthy())
+        ? 'ok'
+        : 'unavailable';
+
+    let migrationsCheck: 'ok' | 'pending' | 'drift' | 'unknown' | 'not_configured' = 'ok';
+    if (!configured) {
+      migrationsCheck = 'not_configured';
+    } else {
+      const report = await container.database.migrationStatus();
+      if (!report) {
+        migrationsCheck = 'unknown';
+      } else if (
+        report.divergedCount > 0 ||
+        report.unknownApplied.length > 0 ||
+        !report.tablePresent
+      ) {
+        migrationsCheck = 'drift';
+      } else if (report.pendingCount > 0) {
+        migrationsCheck = 'pending';
+      }
+    }
+
+    const reason =
+      databaseCheck === 'unavailable'
+        ? 'database_unreachable'
+        : migrationsCheck === 'drift'
+          ? 'migration_drift'
+          : migrationsCheck === 'pending'
+            ? 'migration_pending'
+            : migrationsCheck === 'unknown'
+              ? 'migration_status_unknown'
+              : null;
+    const ready = reason === null;
+
+    return reply.status(ready ? 200 : 503).send({
+      status: ready ? 'ready' : 'not_ready',
+      checks: { database: databaseCheck, migrations: migrationsCheck },
+      reason,
+      note: 'Readiness covers PostgreSQL reachability and schema consistency — the dependencies required to accept generation jobs. Provider/budget readiness is reported by GET /v1/ops/health.',
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  /**
+   * Detailed component health (§2/§3): authenticated, read scope. Uses cached
+   * provider probes and configuration state only — a health request never calls
+   * a paid AI API. Every component carries a sanitized status/message; no
+   * secret, token, prompt or raw provider body is included.
+   */
+  app.get('/v1/ops/health', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['read']);
+    const health = await container.opsService.health();
+    return reply.status(200).send(health);
+  });
+
+  /**
+   * §4 observability: authenticated, read scope. Low-cardinality counters and
+   * ages only (no job ids, product data or keys), consumed by the app's Ops
+   * dashboard and any external scraper with a read token.
+   */
+  app.get('/v1/ops/metrics', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['read']);
+    const metrics = await container.opsService.metrics();
+    return reply.status(200).send(metrics);
+  });
+
+  /**
+   * §8 preflight: authenticated (control). Pure evaluation — it can report
+   * blockers/warnings but can NEVER enable automation, publishing, or store
+   * credentials. Optional services only produce warnings, never blockers, for
+   * local development.
+   */
+  app.get('/v1/ops/preflight', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    const now = new Date();
+    const health = await container.opsService.health(now);
+    const status = container.schedulerStatus(now);
+    const report = evaluatePreflight({
+      health,
+      settings: container.settings.current(),
+      nodeEnv: container.env.NODE_ENV,
+      persistenceBackend: container.persistence.backend,
+      secretsKeyConfigured: container.secretStore.keyConfigured,
+      envImageProvider: container.env.AI_IMAGE_PROVIDER,
+      envCaptionProvider: container.env.AI_TEXT_PROVIDER,
+      timezone: container.env.SCHEDULER_TIMEZONE,
+      postingWindowsCount: status.postingWindows.length,
+      allowedWindowsCount: POSTING_WINDOWS.length,
+      imageReferenceDeclared: preflightImageReferenceDeclared(health),
+      now,
+    });
+    return reply.status(200).send(report);
+  });
+
+  /* ---------------------------------------------------------------------- */
+  /*  PART 8 §6: Telegram notification settings (backend-only credential)    */
+  /* ---------------------------------------------------------------------- */
+
+  // Rate limit for the explicit test action (bounded message rate, §6).
+  let lastTelegramTestAt = 0;
+
+  /** Current notification status — never includes the token or chat id. */
+  app.get('/v1/notifications/telegram', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['read']);
+    const current = container.settings.current();
+    const envConfigured = Boolean(
+      container.env.TELEGRAM_BOT_TOKEN && container.env.TELEGRAM_CHAT_ID,
+    );
+    let stored = false;
+    try {
+      stored = await container.secretStore.has(TELEGRAM_SECRET_BOT_TOKEN);
+    } catch {
+      stored = false;
+    }
+    const configured = stored || envConfigured;
+    const recent = await container.opsMonitor.recent(10);
+    const lastDelivery = recent.find((event) => event.lastNotifiedAt !== null) ?? null;
+
+    return reply.status(200).send({
+      enabled: current.telegramNotificationsEnabled,
+      minSeverity: current.notificationMinSeverity,
+      eventKinds: current.notificationEventKinds,
+      secret: {
+        present: configured,
+        stored,
+        envBootstrap: !stored && envConfigured,
+        keyConfigured: container.secretStore.keyConfigured,
+        location: 'encrypted backend store (AES-256-GCM); the value is never returned by any endpoint.',
+      },
+      lastDelivery: lastDelivery
+        ? {
+            status: lastDelivery.lastDeliveryStatus,
+            at: lastDelivery.lastNotifiedAt,
+            errorCode: lastDelivery.lastErrorCode,
+          }
+        : null,
+      note: 'Bot token and chat id are write-only secrets. Configure them via PUT /v1/notifications/telegram/secret.',
+    });
+  });
+
+  /** Enable/disable + severity floor + event-kind filter (non-sensitive). */
+  app.put('/v1/notifications/telegram', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    const parsed = notificationSettingsSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: {
+          code: 'INVALID_REQUEST',
+          message: 'Expected { enabled?, minSeverity?, eventKinds? } with correct types.',
+          issues: redactDeep(
+            parsed.error.issues.map((issue) => ({
+              rule: issue.path.length > 0 ? issue.path.join('.') : 'body',
+              message: issue.message,
+            })),
+          ),
+        },
+      });
+    }
+    const patch = parseSettingsPatch({
+      ...(parsed.data.enabled !== undefined
+        ? { telegramNotificationsEnabled: parsed.data.enabled }
+        : {}),
+      ...(parsed.data.minSeverity !== undefined
+        ? { notificationMinSeverity: parsed.data.minSeverity }
+        : {}),
+      ...(parsed.data.eventKinds !== undefined
+        ? { notificationEventKinds: parsed.data.eventKinds }
+        : {}),
+    });
+    const settings = await container.settings.update(patch);
+    return reply.status(200).send({
+      enabled: settings.telegramNotificationsEnabled,
+      minSeverity: settings.notificationMinSeverity,
+      eventKinds: settings.notificationEventKinds,
+      updated: true,
+    });
+  });
+
+  /**
+   * Store/replace the Telegram credential. WRITE-ONLY: the values go in and
+   * are sealed with AES-256-GCM; this endpoint and every other response only
+   * ever report presence. Fails closed when SECRETS_ENCRYPTION_KEY is absent.
+   */
+  app.put('/v1/notifications/telegram/secret', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    if (!container.secretStore.keyConfigured) {
+      return reply.status(503).send({
+        error: {
+          code: 'SECRETS_KEY_MISSING',
+          message:
+            'SECRETS_ENCRYPTION_KEY is not configured, so credentials cannot be stored (fail-closed). Set the key and restart.',
+        },
+      });
+    }
+    const parsed = telegramSecretSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: {
+          code: 'INVALID_REQUEST',
+          message:
+            'Expected { botToken, chatId }: non-empty strings without whitespace (20-200 and 1-64 characters).',
+        },
+      });
+    }
+    await container.secretStore.set(TELEGRAM_SECRET_BOT_TOKEN, parsed.data.botToken);
+    await container.secretStore.set(TELEGRAM_SECRET_CHAT_ID, parsed.data.chatId);
+    container.logger.info({}, 'telegram credential stored (values never logged)');
+    return reply.status(200).send({
+      configured: true,
+      secret: { present: true, stored: true },
+      next: 'Send a test notification via POST /v1/notifications/telegram/test.',
+    });
+  });
+
+  app.delete('/v1/notifications/telegram/secret', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    try {
+      await container.secretStore.delete(TELEGRAM_SECRET_BOT_TOKEN);
+      await container.secretStore.delete(TELEGRAM_SECRET_CHAT_ID);
+    } catch {
+      // Deleting a never-stored key is not an error; presence is re-checked below.
+    }
+    container.logger.info({}, 'telegram credential removed');
+    return reply.status(200).send({ configured: false, secret: { present: false, stored: false } });
+  });
+
+  /**
+   * Explicit, user-triggered test notification (§6). Bypasses severity/kind
+   * filters but requires a credential; the response reports EXACTLY what the
+   * transport confirmed — `sent` only when Telegram acknowledged the message.
+   */
+  app.post('/v1/notifications/telegram/test', async (request, reply) => {
+    authenticate(container, request);
+    requireScopes(claimsOf(request), ['control']);
+    const now = Date.now();
+    if (now - lastTelegramTestAt < 5_000) {
+      return reply.status(429).send({
+        error: { code: 'RATE_LIMITED', message: 'Test notifications are limited to one every 5 seconds.' },
+      });
+    }
+    lastTelegramTestAt = now;
+    const result = await container.telegramService.sendTestMessage();
+    return reply.status(200).send({
+      test: true,
+      delivered: result.delivered,
+      status: result.status,
+      messageId: result.messageId ?? null,
+      errorCode: result.errorCode ?? null,
+      note:
+        result.status === 'not_configured'
+          ? 'No credential is stored. Save the bot token and chat id first.'
+          : result.delivered
+            ? 'Telegram confirmed the message.'
+            : 'Delivery failed; see errorCode. The event was not reported as sent.',
+      at: new Date().toISOString(),
     });
   });
 

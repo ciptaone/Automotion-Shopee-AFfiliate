@@ -758,6 +758,149 @@ Map<String, dynamic> usageSummaryFixture({
               'unknown — never silently treated as zero.',
     };
 
+/* -------------------------------------------------------------------------- */
+/*  Part 8 fixture: ops health report (GET /v1/ops/health)                     */
+/* -------------------------------------------------------------------------- */
+
+Map<String, dynamic> opsComponentFixture(
+  String key,
+  String displayName,
+  String status, {
+  String code = 'ok',
+  String message = 'ok',
+  String criticality = 'operational',
+  Map<String, dynamic> data = const {},
+}) =>
+    {
+      'key': key,
+      'displayName': displayName,
+      'status': status,
+      'code': code,
+      'message': message,
+      'criticality': criticality,
+      'data': data,
+      'checkedAt': '2026-10-12T03:00:00.000Z',
+    };
+
+Map<String, dynamic> opsHealthFixture({
+  String overall = 'healthy',
+  bool ready = true,
+  List<String> blockers = const [],
+  String schedulerMode = 'mock',
+  String automationState = 'running',
+  bool schedulerEnabled = true,
+  Map<String, dynamic>? queue,
+  List<Map<String, dynamic>> recentEvents = const [],
+  List<Map<String, dynamic>> components = const [],
+}) =>
+    {
+      'overall': overall,
+      'ready': ready,
+      'blockers': blockers,
+      'checkedAt': '2026-10-12T03:00:00.000Z',
+      'components': components.isEmpty
+          ? [
+              opsComponentFixture('backend', 'Backend process', 'healthy',
+                  code: 'ok', criticality: 'required'),
+              opsComponentFixture('database', 'PostgreSQL', 'not_configured',
+                  code: 'database_not_configured',
+                  message: 'No database configured (development mode).',
+                  criticality: 'required'),
+              opsComponentFixture('migrations', 'Schema migrations', 'not_configured',
+                  code: 'migrations_not_configured',
+                  message: 'No database configured (development mode).',
+                  criticality: 'required'),
+              opsComponentFixture('scheduler', 'Scheduler', 'healthy',
+                  code: 'ok'),
+              opsComponentFixture('queue', 'Job queue', 'healthy', code: 'ok'),
+              opsComponentFixture('caption_provider', 'Caption provider',
+                  'not_configured',
+                  code: 'provider_not_configured',
+                  message: 'No text provider is selected.'),
+              opsComponentFixture('image_provider', 'Image provider',
+                  'not_configured',
+                  code: 'provider_not_configured',
+                  message: 'No image provider is selected.'),
+              opsComponentFixture('asset_storage', 'Asset storage', 'healthy',
+                  code: 'storage_ready', data: {'kind': 's3'}),
+              opsComponentFixture('telegram', 'Telegram notifications',
+                  'not_configured',
+                  code: 'telegram_not_configured',
+                  message: 'No bot token stored.',
+                  criticality: 'optional'),
+              opsComponentFixture('budget', 'Generation budget', 'healthy',
+                  code: 'budget_not_configured'),
+              opsComponentFixture('publishing_gate', 'Publishing gate',
+                  'disabled',
+                  code: 'publishing_disabled',
+                  message: 'Live publishing is disabled by design.',
+                  criticality: 'optional',
+                  data: {
+                    'facebook': 'disabled',
+                    'threads': 'disabled',
+                    'pipelineTerminalStage': 'publish_ready',
+                  }),
+            ]
+          : components,
+      'uptimeSeconds': 3600,
+      'persistenceBackend': 'memory',
+      'scheduler': {
+        'enabled': schedulerEnabled,
+        'mode': schedulerMode,
+        'timezone': 'Asia/Jakarta',
+        'automationState': automationState,
+        'dailyPostTarget': 4,
+        'slotsToday': 1,
+        'today': '2026-10-12',
+        'nextSlotAt': '2026-10-12T05:00:00.000Z',
+        'lastTickAt': '2026-10-12T02:00:00.000Z',
+        'lastSuccessfulTickAt': '2026-10-12T02:00:00.000Z',
+        'lastTickSkipped': 0,
+        'lastTickExecuted': 1,
+      },
+      'queue': queue ??
+          {
+            'pending': 2,
+            'running': 0,
+            'succeeded': 5,
+            'failed': 1,
+            'cancelled': 0,
+            'retrying': 1,
+            'oldestPendingAt': '2026-10-12T02:30:00.000Z',
+            'oldestPendingAgeMs': 1800000,
+            'expiredLeases': 0,
+          },
+      'recentEvents': recentEvents,
+    };
+
+Map<String, dynamic> opsEventFixture({
+  String fingerprint = 'scheduler_tick_failed',
+  String kind = 'scheduler_tick_failed',
+  String severity = 'critical',
+  String title = 'Scheduler tick failed',
+  String? detail = 'boom',
+  int occurrences = 3,
+  String lastDeliveryStatus = 'sent',
+  String? lastErrorCode,
+  String? lastMessageId = '42',
+  String? lastNotifiedAt = '2026-10-12T02:01:00.000Z',
+}) =>
+    {
+      'fingerprint': fingerprint,
+      'kind': kind,
+      'severity': severity,
+      'title': title,
+      'detail': detail,
+      'occurrences': occurrences,
+      'firstSeenAt': '2026-10-12T02:00:00.000Z',
+      'lastSeenAt': '2026-10-12T02:05:00.000Z',
+      'cooldownUntil': '2026-10-12T02:16:00.000Z',
+      'lastDeliveryStatus': lastDeliveryStatus,
+      'lastErrorCode': lastErrorCode,
+      'lastMessageId': lastMessageId,
+      'lastNotifiedAt': lastNotifiedAt,
+    };
+
 Map<String, dynamic> providerTestResultFixture({
   bool ok = true,
   String kind = 'connection',

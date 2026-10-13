@@ -16,7 +16,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { DailyPostLimitError } from '../core/errors.js';
-import type { EnqueueJobInput, JobQueue, JobRecord } from '../contracts/index.js';
+import type { EnqueueJobInput, JobQueue, JobRecord, QueueStats } from '../contracts/index.js';
 
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
 
@@ -200,6 +200,45 @@ export class InMemoryJobQueue implements JobQueue {
       }
     }
     return count;
+  }
+
+  /**
+   * PART 8 4: observability snapshot. The in-memory queue has no leases, so
+   * `expiredLeases` is always 0 there by definition.
+   */
+  async stats(): Promise<QueueStats> {
+    const counts: Record<JobRecord['status'], number> = {
+      pending: 0,
+      running: 0,
+      succeeded: 0,
+      failed: 0,
+      cancelled: 0,
+    };
+    let retrying = 0;
+    let oldestPendingAt: string | null = null;
+
+    for (const job of this.jobs.values()) {
+      counts[job.status] = (counts[job.status] ?? 0) + 1;
+      if (job.status === 'pending') {
+        if (job.attempts > 0) retrying += 1;
+        if (oldestPendingAt === null || Date.parse(job.scheduledFor) < Date.parse(oldestPendingAt)) {
+          oldestPendingAt = job.scheduledFor;
+        }
+      }
+    }
+
+    return {
+      pending: counts.pending,
+      running: counts.running,
+      succeeded: counts.succeeded,
+      failed: counts.failed,
+      cancelled: counts.cancelled,
+      retrying,
+      oldestPendingAt,
+      oldestPendingAgeMs:
+        oldestPendingAt === null ? null : Math.max(0, this.now().getTime() - Date.parse(oldestPendingAt)),
+      expiredLeases: 0,
+    };
   }
 
   /**

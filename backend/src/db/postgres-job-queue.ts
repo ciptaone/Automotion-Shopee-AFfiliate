@@ -37,6 +37,7 @@ import type {
   JobQueue,
   JobRecord,
   LeaseRecoverySummary,
+  QueueStats,
 } from '../contracts/index.js';
 import type { Database } from './client.js';
 
@@ -433,6 +434,51 @@ export class PostgresJobQueue implements JobQueue {
       sql`select count(*)::int as count from jobs where status = ${status}`,
     );
     return row ? Number(row.count) : 0;
+  }
+
+  /**
+   * PART 8 4: observability snapshot in ONE round trip. Age uses the database
+   * clock, like leases, so app clock skew cannot inflate or hide a backlog.
+   * Low-cardinality: counts and ages only — never job ids or payloads.
+   */
+  async stats(): Promise<QueueStats> {
+    const row = await firstOf(
+      this.db,
+      sql`
+        select
+          count(*) filter (where status = 'pending')::int                 as pending,
+          count(*) filter (where status = 'running')::int                 as running,
+          count(*) filter (where status = 'succeeded')::int               as succeeded,
+          count(*) filter (where status = 'failed')::int                  as failed,
+          count(*) filter (where status = 'cancelled')::int               as cancelled,
+          count(*) filter (where status = 'pending' and attempts > 0)::int as retrying,
+          min(scheduled_for) filter (where status = 'pending')            as oldest_pending_at,
+          round(extract(epoch from (now() - min(scheduled_for) filter (where status = 'pending'))) * 1000)::bigint
+                                                                          as oldest_pending_age_ms,
+          count(*) filter (where status = 'running'
+                             and lease_expires_at is not null
+                             and lease_expires_at <= now())::int          as expired_leases
+        from jobs`,
+    );
+    const numberOf = (key: string): number => (row?.[key] === null || row?.[key] === undefined ? 0 : Number(row[key]));
+    const oldestPendingAt =
+      row?.oldest_pending_at === null || row?.oldest_pending_at === undefined
+        ? null
+        : iso(row.oldest_pending_at);
+    return {
+      pending: numberOf('pending'),
+      running: numberOf('running'),
+      succeeded: numberOf('succeeded'),
+      failed: numberOf('failed'),
+      cancelled: numberOf('cancelled'),
+      retrying: numberOf('retrying'),
+      oldestPendingAt,
+      oldestPendingAgeMs:
+        row?.oldest_pending_age_ms === null || row?.oldest_pending_age_ms === undefined
+          ? null
+          : Number(row.oldest_pending_age_ms),
+      expiredLeases: numberOf('expired_leases'),
+    };
   }
 
   /**

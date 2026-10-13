@@ -126,6 +126,17 @@ async function main(): Promise<void> {
       },
       'database ready; startup recovery complete',
     );
+
+    // PART 8 §6: stuck leases found at boot are worth an operator's attention.
+    if (recovery.requeuedJobs > 0 || recovery.failedJobs > 0) {
+      void container.opsMonitor.record({
+        kind: 'recovery_performed',
+        severity: 'warning',
+        title: 'Startup recovery touched stuck jobs',
+        detail: `${recovery.requeuedJobs} job(s) requeued, ${recovery.failedJobs} marked failed (attempt budget spent), ${recovery.releasedSlotLocks} slot lock(s) released.`,
+        scope: 'startup',
+      });
+    }
   }
 
   /* --- 5. Server --- */
@@ -206,6 +217,18 @@ async function main(): Promise<void> {
       } catch (error) {
         // Recoverable: log and keep the loop alive for the next tick.
         logger.error({ err: error }, 'content scheduler tick failed; continuing');
+        // PART 8 §6: repeated tick failures are how "scheduler stopped
+        // unexpectedly" becomes visible. Fingerprinted per fault class by the
+        // monitor's cooldown, so a persistent failure notifies once per window.
+        void container.opsMonitor.record({
+          kind: 'scheduler_tick_failed',
+          severity: 'critical',
+          title: 'Scheduler tick failed',
+          detail:
+            error instanceof Error
+              ? (error.message.split('\n')[0] ?? 'unknown error').slice(0, 300)
+              : 'unknown error',
+        });
       }
     };
 
@@ -231,9 +254,54 @@ async function main(): Promise<void> {
     }
   };
 
-  // Register the stop hook on the existing shutdown path.
+  /* --- 7. PART 8 §6: periodic operational evaluation + notifications --- */
+  // Runs INDEPENDENTLY of the scheduler loop so database, schema, budget and
+  // provider faults surface even when scheduling is disabled. Each pass is one
+  // health gathering + a deduplicated record (persistent fingerprint, cooldown
+  // window), so a standing problem re-notifies at most once per cooldown
+  // instead of every pass. It never throws, and it never enables anything.
+  const OPS_EVAL_INTERVAL_MS = 5 * 60_000;
+  const OPS_CLEANUP_EVERY_N_TICKS = 288; // ~once a day at 5-minute cadence
+  let opsTimer: NodeJS.Timeout | null = null;
+  let opsEvalCount = 0;
+
+  const runOpsEvaluation = async (): Promise<void> => {
+    try {
+      await container.opsService.evaluateAndNotify();
+      opsEvalCount += 1;
+      if (opsEvalCount % OPS_CLEANUP_EVERY_N_TICKS === 0) {
+        const { deleted } = await container.opsMonitor.runCleanup();
+        if (deleted > 0) {
+          logger.info({ deleted }, 'ops_events retention cleanup (90 days / 200 per kind)');
+        }
+      }
+    } catch (error) {
+      // Defensive: evaluateAndNotify already swallows its own failures.
+      logger.warn({ err: error }, 'ops evaluation pass failed; continuing');
+    }
+  };
+
+  opsTimer = setInterval(() => void runOpsEvaluation(), OPS_EVAL_INTERVAL_MS);
+  // First pass shortly after boot (post-recovery, DB verified), then cadence.
+  setTimeout(() => void runOpsEvaluation(), 15_000);
+  logger.info(
+    { intervalMs: OPS_EVAL_INTERVAL_MS },
+    'ops evaluation loop started (health events + notifications)',
+  );
+
+  const stopOpsEvaluation = (): void => {
+    if (opsTimer) {
+      clearInterval(opsTimer);
+      opsTimer = null;
+      logger.info({}, 'ops evaluation loop stopped');
+    }
+  };
+
+  // Register the stop hooks on the existing shutdown path.
   process.prependListener('SIGINT', stopScheduler);
   process.prependListener('SIGTERM', stopScheduler);
+  process.prependListener('SIGINT', stopOpsEvaluation);
+  process.prependListener('SIGTERM', stopOpsEvaluation);
 }
 
 void main();

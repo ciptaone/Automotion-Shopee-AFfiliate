@@ -4,11 +4,12 @@ import '../core/autopilot_api.dart';
 import 'dashboard_screen.dart';
 import 'history_screen.dart';
 import 'integrations_screen.dart';
+import 'ops_screen.dart';
 import 'preview_screen.dart';
 import 'providers_screen.dart';
 import 'settings_screen.dart';
 
-/// Root shell after sign-in: six tabs over the control surface.
+/// Root shell after sign-in: seven tabs over the control surface.
 ///
 /// Tabs are kept alive in an [IndexedStack] so switching back to the dashboard
 /// does not throw away its state or re-trigger a network call.
@@ -36,6 +37,7 @@ class _HomeShellState extends State<HomeShell> {
     (label: 'History', icon: Icons.history_outlined),
     (label: 'Services', icon: Icons.hub_outlined),
     (label: 'AI', icon: Icons.smart_toy_outlined),
+    (label: 'Ops', icon: Icons.monitor_heart_outlined),
   ];
 
   @override
@@ -53,6 +55,7 @@ class _HomeShellState extends State<HomeShell> {
           HistoryScreen(api: api, onSignedOut: onSignedOut),
           IntegrationsScreen(api: api, onSignedOut: onSignedOut),
           ProvidersScreen(api: api, onSignedOut: onSignedOut),
+          OpsScreen(api: api, onSignOut: onSignedOut),
         ],
       ),
       bottomNavigationBar: NavigationBar(

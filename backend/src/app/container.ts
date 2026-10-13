@@ -79,7 +79,25 @@ import {
   StubGraphTransport,
   ThreadsPublisher,
 } from '../integrations/publishing/publishers.js';
-import { MemoryTelegramTransport, TelegramNotifier } from '../integrations/notifications/telegram.js';
+import {
+  LazyTelegramTransport,
+  MemoryTelegramTransport,
+  TelegramNotificationService,
+  TelegramNotifier,
+  type TelegramRuntimeConfig,
+  type TelegramSettingsSource,
+} from '../integrations/notifications/telegram.js';
+import {
+  InMemoryOpsEventStore,
+  OpsMonitor,
+  PostgresOpsEventStore,
+  type OpsEventStore,
+} from '../ops/ops-events.js';
+import {
+  OpsService,
+  TELEGRAM_SECRET_BOT_TOKEN,
+  TELEGRAM_SECRET_CHAT_ID,
+} from '../ops/ops-service.js';
 import {
   DEFAULT_SCHEDULER_CONFIG,
   clampDailyPostTarget,
@@ -135,6 +153,16 @@ export interface AppContainer {
   readonly facebookPublisher: Publisher;
   readonly threadsPublisher: Publisher;
   readonly notifier: Notifier;
+  /** PART 8: encrypted credential store (write-only from the HTTP layer). */
+  readonly secretStore: SecretStore;
+  /** PART 8 §7: durable operational events + cooldowns (memory in dev/tests). */
+  readonly opsEvents: OpsEventStore;
+  /** PART 8 §6: deduplicated event recording + best-effort notification. */
+  readonly opsMonitor: OpsMonitor;
+  /** PART 8 §2-§4: health/readiness/metrics aggregation. */
+  readonly opsService: OpsService;
+  /** PART 8 §6: Telegram delivery (notifications + explicit test action). */
+  readonly telegramService: TelegramNotificationService;
   readonly schedulerConfig: SchedulerConfig;
   /** PART 5: durable scheduler tick state (postgres) or process-local (dev). */
   readonly schedulerCheckpoints: SchedulerCheckpointStore;
@@ -437,6 +465,46 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
       telegramTransport,
     );
 
+  /* --- PART 8 §6/§7: operational events + Telegram delivery ------------- */
+  // Credential resolution is read PER DELIVERY: encrypted API-stored secrets
+  // win, environment variables remain the documented bootstrap path, and
+  // `enabled`/filters come from the persisted APK settings. Nothing is cached,
+  // so rotating or revoking a credential takes effect on the next event.
+  const telegramSettingsSource: TelegramSettingsSource = {
+    async resolve(): Promise<TelegramRuntimeConfig> {
+      const current = settings.current();
+      let storedToken: string | null = null;
+      let storedChatId: string | null = null;
+      try {
+        storedToken = await secretStore.get(TELEGRAM_SECRET_BOT_TOKEN);
+        storedChatId = await secretStore.get(TELEGRAM_SECRET_CHAT_ID);
+      } catch {
+        // Missing encryption key or unreadable row => treated as not configured.
+      }
+      return {
+        botToken: storedToken ?? env.TELEGRAM_BOT_TOKEN ?? null,
+        chatId: storedChatId ?? env.TELEGRAM_CHAT_ID ?? null,
+        enabled: current.telegramNotificationsEnabled,
+        minSeverity: current.notificationMinSeverity,
+        eventKinds:
+          current.notificationEventKinds.length > 0 ? [...current.notificationEventKinds] : 'all',
+      };
+    },
+  };
+
+  const opsEventStore: OpsEventStore = postgresDb
+    ? new PostgresOpsEventStore(postgresDb)
+    : new InMemoryOpsEventStore();
+
+  const telegramService = new TelegramNotificationService({
+    settings: telegramSettingsSource,
+    transport: new LazyTelegramTransport(telegramSettingsSource),
+  });
+
+  // The monitor deduplicates by persistent fingerprint + cooldown, so event
+  // sources can record freely; delivery failures are recorded, never re-emitted.
+  const opsMonitor = new OpsMonitor({ store: opsEventStore, notifier: telegramService, logger });
+
   const corsOrigins = parseCorsOrigins(env.CORS_ORIGINS);
 
   /** The real content pipeline. Never publishes: live publishing stays disabled. */
@@ -462,6 +530,29 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     checkpoints: schedulerCheckpoints,
     tickLock:
       postgresDb && database.raw ? new PostgresSchedulerTickLock(database.raw) : undefined,
+    // PART 8 §6: terminal job failures become durable, deduplicated events.
+    opsMonitor,
+  });
+
+  /* --- PART 8 §2-§4: health / readiness / metrics aggregation ------------ */
+  const opsService = new OpsService({
+    env,
+    version: '0.1.0',
+    startTime: new Date(),
+    logger,
+    database,
+    persistenceBackend: persistence.backend,
+    queue,
+    settings,
+    providers,
+    usage,
+    storage,
+    contentScheduler,
+    schedulerStatus: (now?: Date) => container.schedulerStatus(now),
+    schedulerLoopStatus: () => container.schedulerLoopStatus(),
+    secrets: secretStore,
+    recentEvents: (limit: number) => opsMonitor.recent(limit),
+    monitor: opsMonitor,
   });
 
   const container: AppContainer = {
@@ -482,6 +573,11 @@ export function buildContainer(options: BuildContainerOptions): AppContainer {
     facebookPublisher,
     threadsPublisher,
     notifier,
+    secretStore,
+    opsEvents: opsEventStore,
+    opsMonitor,
+    opsService,
+    telegramService,
     schedulerConfig,
     schedulerCheckpoints,
     catalog,
